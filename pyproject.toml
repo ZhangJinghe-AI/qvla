@@ -1,0 +1,43 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "qvla"
+version = "0.1.0"
+description = "QVLA (W4A4) quantization for VLA models — model-agnostic core + per-model adapters."
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.24",
+    "tqdm>=4.65",
+    "phyai",
+    "phyai-kernel",
+    "phyai-ext",
+    "phyai-model-optimizer",
+    "phyai-utils-tools",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/qvla"]
+
+[dependency-groups]
+dev = [
+    "matplotlib>=3.8",
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+
+[tool.uv.sources]
+phyai = { path = "../phyai/phyai", editable = true }
+phyai-kernel = { path = "../phyai/phyai-kernel", editable = true }
+phyai-ext = { path = "../phyai/phyai-ext", editable = true }
+phyai-model-optimizer = { path = "../phyai/phyai-model-optimizer", editable = true }
+phyai-utils-tools = { path = "../phyai/phyai-utils-tools", editable = true }
+
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "tools"]
+pythonpath = ["src", "tools"]
+
+[tool.ruff.format]
+preview = false
