@@ -34,7 +34,7 @@ from qvla.runtime import QuantLinear
 from qvla.core.quantize import (
     QuantizedWeight, dequantize, gptq_quantize, is_no_quant, no_quantize,
     quantize_weight, rtn_quantize,
-    rtn_residual_quantize,
+    rtn_residual_quantize, symmetric_quant_range,
 )
 from qvla.build.collector import (
     LayerStats,
@@ -212,7 +212,7 @@ def test_activation_svd_after_perm_matches_direct_u_fit():
         svd_source="activation",
     )
     perm_stats = LayerStats(in_features=d)
-    perm_stats.static_amax = amax
+    perm_stats.static_channel_amax = amax
     perm_stats.n_tokens = X.shape[0]
     builder.fit_step(0, stats=perm_stats)
 
@@ -484,7 +484,7 @@ def test_enable_quantization_replaces_and_forwards():
 # --------------------------------------------------------------------------- #
 
 
-def test_act_percentile_amax_is_per_channel_not_cross_channel():
+def test_act_channel_percentile_amax_is_inner_not_cross():
     """Act scales use each channel's own value distribution, not a global cap."""
     from qvla.build.collector import LayerStats
     from qvla.core.quantize import (
@@ -505,11 +505,11 @@ def test_act_percentile_amax_is_per_channel_not_cross_channel():
     stats = LayerStats(in_features=2)
     stats.static_abs_samples = [x.abs()]
 
-    per_ch = stats.act_percentile_amax(99.9)
+    per_ch = stats.act_channel_percentile_amax(99.9)
     expected = channel_percentile_amax(x.abs(), 99.9)
     assert torch.allclose(per_ch, expected, rtol=1e-5, atol=1e-5)
 
-    # Legacy cross-channel cap would clamp both channels to the same global q.
+    # Legacy cross cap would clamp both channels to the same global q.
     legacy = percentile_amax(x.abs().amax(dim=0), 99.9)
     assert not torch.allclose(per_ch, legacy)
 
@@ -545,7 +545,7 @@ def test_rotated_act_scale_collector_matches_rotation_apply():
         lin(x)
     h.remove()
 
-    collected = col.stats["layer"].per_step_amax[1]
+    collected = col.stats["layer"].per_step_channel_amax[1]
     assert torch.allclose(collected, manual, rtol=1e-5, atol=1e-5)
 
 
@@ -579,3 +579,78 @@ def test_per_step_counter_advances():
         pre = layer._step_counter % layer._num_steps
         assert pre == expected_step
         _ = layer(x)
+
+
+def test_static_per_token_uses_offline_table():
+    """per_token static reads per-token scales from act_scale_table."""
+    K, N = 64, 32
+    W = torch.randn(N, K) * 0.05
+    qw = rtn_quantize(W, group_size=64)
+    table = torch.tensor([0.5, 0.1], dtype=torch.float32)
+    layer_pack = LayerPack(
+        name="dit.layer",
+        scope="dit",
+        in_features=K,
+        out_features=N,
+        bias_present=False,
+        qweight=qw.qweight,
+        weight_scale=qw.weight_scale,
+        group_size=qw.group_size,
+        weight_bits=qw.weight_bits,
+        rotation=identity_rotation(K, 64),
+        act_bits=4,
+        act_scale_mode="static",
+        act_scale_granularity="per_token",
+        act_scale_table=table,
+        bias=None,
+        residual=None,
+    )
+    layer = QuantLinear(
+        layer_pack,
+        return_tuple=False,
+        skip_bias_add=False,
+        output_dtype=torch.float32,
+        device="cpu",
+    )
+    x = torch.randn(2, K)
+    scale = layer._activation_scale(x)
+    assert scale.shape == (2, 1)
+    assert torch.allclose(scale, table.view(2, 1))
+
+
+def test_per_token_scales_tile_across_batch():
+    """Calibrated chunk_size scales tile when expert flattens B*chunk tokens."""
+    K, N, chunk, batch = 64, 32, 50, 16
+    W = torch.randn(N, K) * 0.05
+    qw = rtn_quantize(W, group_size=64)
+    table = torch.linspace(0.01, 0.5, chunk, dtype=torch.float32).unsqueeze(0).repeat(10, 1)
+    layer_pack = LayerPack(
+        name="dit.layer",
+        scope="dit",
+        in_features=K,
+        out_features=N,
+        bias_present=False,
+        qweight=qw.qweight,
+        weight_scale=qw.weight_scale,
+        group_size=qw.group_size,
+        weight_bits=qw.weight_bits,
+        rotation=identity_rotation(K, 64),
+        act_bits=4,
+        act_scale_mode="per_step",
+        act_scale_granularity="per_token",
+        act_scale_table=table,
+        bias=None,
+        residual=None,
+    )
+    layer = QuantLinear(
+        layer_pack,
+        return_tuple=False,
+        skip_bias_add=False,
+        output_dtype=torch.float32,
+        device="cpu",
+    )
+    x = torch.randn(batch * chunk, K)
+    scale = layer._activation_scale(x)
+    assert scale.shape == (batch * chunk, 1)
+    assert torch.allclose(scale, table[0].repeat(batch).view(-1, 1))
+    _ = layer(x)  # full forward must not raise

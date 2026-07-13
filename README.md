@@ -41,7 +41,7 @@ src/qvla/
     collector.py         # activation-capture hooks during calibration
     fisher.py            # Fisher sensitivity (policy-aware DiT rotation)
     differentiable_forward.py
-    attention_ste.py
+    attention_grad.py
 
   adapters/              # per-model glue (regexes, calibration loop)
     base.py

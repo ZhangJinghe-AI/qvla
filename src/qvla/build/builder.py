@@ -15,6 +15,7 @@ End-to-end pipeline:
 
 from __future__ import annotations
 
+import gc
 import logging
 import time
 from collections import defaultdict
@@ -63,10 +64,22 @@ def _act_scale_amax(
     stats: LayerStats, scope_cfg: ScopeConfig, *, step: int | None = None
 ) -> torch.Tensor:
     p = scope_cfg.act_percentile
-    if scope_cfg.act_percentile_mode == "cross_channel":
-        row = stats.static_amax if step is None else stats.per_step_amax[step]
-        return percentile_amax(row, p)
-    return stats.act_percentile_amax(p, step=step)
+    if step is None:
+        if scope_cfg.act_scale_granularity == "per_token":
+            if scope_cfg.act_percentile_mode == "cross":
+                return percentile_amax(stats.static_token_amax, p)
+            return stats.act_token_percentile_amax(p, step=step)
+        if scope_cfg.act_percentile_mode == "cross":
+            return percentile_amax(stats.static_channel_amax, p)
+        return stats.act_channel_percentile_amax(p, step=step)
+
+    if scope_cfg.act_scale_granularity == "per_token":
+        if scope_cfg.act_percentile_mode == "cross":
+            return percentile_amax(stats.per_step_token_amax[step], p)
+        return stats.act_token_percentile_amax(p, step=step)
+    if scope_cfg.act_percentile_mode == "cross":
+        return percentile_amax(stats.per_step_channel_amax[step], p)
+    return stats.act_channel_percentile_amax(p, step=step)
 
 
 def _build_act_scale_table(
@@ -81,7 +94,7 @@ def _build_act_scale_table(
     if scope_cfg.act_scale_mode == "static":
         amax = _act_scale_amax(stats, scope_cfg)
         return (amax.clamp_min(1e-12) / act_qmax).to(torch.float32)
-    if stats.per_step_amax is None:
+    if stats.per_step_channel_amax is None:
         logger.warning(
             "Requested per_step scales but collector has no per-step amax; "
             "downgrading to static."
@@ -90,7 +103,7 @@ def _build_act_scale_table(
         return (amax.clamp_min(1e-12) / act_qmax).unsqueeze(0).to(torch.float32)
     rows = [
         _act_scale_amax(stats, scope_cfg, step=s)
-        for s in range(stats.per_step_amax.shape[0])
+        for s in range(stats.per_step_channel_amax.shape[0])
     ]
     table = torch.stack(rows, dim=0).clamp_min(1e-12) / act_qmax
     return table.to(torch.float32)
@@ -132,7 +145,9 @@ def _run_transformed_calibration(
         with torch.inference_mode():
             for i, batch in enumerate(adapter.iter_calibration_batches(num_samples)):
                 logger.info("%s sample %d/%d ...", log_label, i + 1, num_samples)
-                adapter.forward_for_calibration(model, batch, step_callback=step_cb)
+                adapter.forward_for_calibration(
+                    model, batch, step_callback=step_cb, sample_index=i
+                )
                 if progress:
                     frac = progress_base + progress_span * (i + 1) / max(1, num_samples)
                     progress("calibrate", frac)
@@ -214,6 +229,12 @@ def _build_rotations_pipeline_wise(
                 step_idx += 1
                 for name, _, _ in scope_targets:
                     builders[name].fit_step(step_index, stats=stats[name])
+                # Each activation-calibration pass allocates one float64 X.T@X per
+                # target layer on CPU (~40 GiB for pi0.5 LLM). Free before the
+                # next pass so the RHS of ``stats = _run_transformed_calibration``
+                # does not briefly double peak RSS (perm then svd both need stats).
+                del stats
+                gc.collect()
             else:
                 for name, _, _ in scope_targets:
                     builders[name].fit_step(step_index, stats=None)
@@ -281,6 +302,7 @@ def _make_layer_pack(
         rotation=rotation,
         act_bits=scope_cfg.act_bits,
         act_scale_mode=scope_cfg.act_scale_mode,
+        act_scale_granularity=scope_cfg.act_scale_granularity,
         act_scale_table=act_scale_table,
         bias=bias,
         residual=qw.residual,
@@ -318,6 +340,10 @@ def build_pack(
     )
 
     adapter.warmup_for_calibration(model)
+
+    from qvla.build.calibration_noise import install_per_sample_calibration_noise
+
+    install_per_sample_calibration_noise(adapter, build_seed=config.build_seed)
 
     fisher_sensitivities: dict[str, torch.Tensor] = {}
     if config.needs_fisher:

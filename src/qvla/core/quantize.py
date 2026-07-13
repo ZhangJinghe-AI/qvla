@@ -53,6 +53,31 @@ def percentile_amax(amax_row: torch.Tensor, percentile: float) -> torch.Tensor:
     return amax_row.clamp_max(q)
 
 
+def token_percentile_amax(row_amax: torch.Tensor, percentile: float) -> torch.Tensor:
+    """``percentile`` of per-token amax values (1-D tensor of row maxes)."""
+    if percentile >= 100.0:
+        return row_amax.max()
+    return torch.quantile(row_amax.to(torch.float32), percentile / 100.0)
+
+
+def token_position_percentile_amax(
+    abs_activations: torch.Tensor, percentile: float
+) -> torch.Tensor:
+    """Per-token-position ``percentile`` of ``|activations|`` along batch+channel."""
+    if abs_activations.ndim != 3:
+        raise ValueError(
+            f"token_position_percentile_amax expects (batch, num_tokens, in_features), "
+            f"got {tuple(abs_activations.shape)}."
+        )
+    if percentile >= 100.0:
+        return abs_activations.abs().amax(dim=(0, 2))
+    # torch.quantile only accepts a single dim; fold batch×channel into one axis.
+    x = abs_activations.to(torch.float32).permute(1, 0, 2).reshape(
+        abs_activations.shape[1], -1
+    )
+    return torch.quantile(x, percentile / 100.0, dim=1)
+
+
 def channel_percentile_amax(
     abs_activations: torch.Tensor, percentile: float
 ) -> torch.Tensor:
@@ -466,6 +491,8 @@ __all__ = [
     "is_no_quant",
     "no_quantize",
     "channel_percentile_amax",
+    "token_percentile_amax",
+    "token_position_percentile_amax",
     "percentile_amax",
     "quantize_weight",
     "rtn_quantize",

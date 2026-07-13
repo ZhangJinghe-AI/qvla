@@ -64,14 +64,14 @@ VARIANT_ORDER: tuple[VariantName, ...] = (
 
 VARIANT_PIPELINES: dict[VariantName, tuple[PipelineStep, ...]] = {
     "original": (),
-    "hadamard": ("random_hadamard",),
+    "hadamard": ("hadamard",),
     "svd": ("svd",),
-    "perm_hadamard": ("perm", "random_hadamard"),
-    "svd_hadamard": ("svd", "random_hadamard"),
-    "h_perm_h": ("random_hadamard", "perm", "random_hadamard"),
-    "svd_perm_h": ("svd", "perm", "random_hadamard"),
-    "perm_svd_h": ("perm", "svd", "random_hadamard"),
-    "perm_h2": ("perm", "random_hadamard", "random_hadamard"),
+    "perm_hadamard": ("perm", "hadamard"),
+    "svd_hadamard": ("svd", "hadamard"),
+    "h_perm_h": ("hadamard", "perm", "hadamard"),
+    "svd_perm_h": ("svd", "perm", "hadamard"),
+    "perm_svd_h": ("perm", "svd", "hadamard"),
+    "perm_h2": ("perm", "hadamard", "hadamard"),
 }
 
 VARIANT_WEIGHT_TITLES: dict[VariantName, str] = {
@@ -223,7 +223,7 @@ def _layer_stats_from_tokens(
     if stats.n_tokens == 0:
         raise ValueError("activation_tokens must contain at least one token.")
     if step == "perm":
-        stats.static_amax = flat.abs().amax(dim=0).to(torch.float32)
+        stats.static_channel_amax = flat.abs().amax(dim=0).to(torch.float32)
     elif step == "svd":
         stats.xtx = (flat.T @ flat).to(torch.float64)
     return stats

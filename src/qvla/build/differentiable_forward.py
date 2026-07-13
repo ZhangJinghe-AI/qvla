@@ -23,10 +23,11 @@ import torch.nn.functional as F
 
 from phyai.payload import LLMForwardBatch, VisionForwardBatch
 
-from qvla.build.attention_ste import (
-    attach_sensitivity_metadata,
-    patch_attention_ste,
-    restore_attention_ste,
+from qvla.build.attention_grad import (
+    attach_attention_metadata,
+    clear_prefix_kv_tape,
+    patch_attention_for_grad,
+    restore_attention_for_grad,
 )
 
 if TYPE_CHECKING:
@@ -34,11 +35,6 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
-
-
-def _tensor_in_autograd_graph(t: torch.Tensor) -> bool:
-    """True when ``t`` participates in the current autograd graph."""
-    return torch.is_grad_enabled() and (t.requires_grad or t.grad_fn is not None)
 
 
 def _linear_with_bias(layer: Any, x: torch.Tensor) -> torch.Tensor:
@@ -54,8 +50,8 @@ def _linear_forward_with_bias_tuple(layer: Any, x: torch.Tensor) -> tuple[torch.
     return y, bias_out
 
 
-def _is_expert_stack_linear(mod: nn.Module) -> bool:
-    """True for phyai linears inside the expert stack (not ``QuantLinear``)."""
+def _is_grad_linear(mod: nn.Module) -> bool:
+    """True for phyai linears that should use ``F.linear`` under autograd."""
     from qvla.runtime.quant_linear import QuantLinear
     from qvla.runtime.wrap import _is_linear_like
 
@@ -64,17 +60,10 @@ def _is_expert_stack_linear(mod: nn.Module) -> bool:
     return _is_linear_like(mod)
 
 
-def patch_expert_linears_for_grad(expert_stack: Any) -> list[Any]:
-    """Route expert-stack linears through ``F.linear`` when grad is needed.
-
-    FlashInfer GEMM (the default phyai linear backend) has no autograd.  During
-    the Fisher / sensitivity passes the expert stack is still full-precision, so
-    without this patch gradients stop at the first ``qkv_proj`` and every DiT
-    layer reports zero Fisher sensitivity.
-    """
+def _patch_linears_for_grad(root: nn.Module, *, log_label: str) -> list[Any]:
     patched: list[Any] = []
-    for mod in expert_stack.modules():
-        if not _is_expert_stack_linear(mod):
+    for mod in root.modules():
+        if not _is_grad_linear(mod):
             continue
         if getattr(mod, "_qvla_linear_grad_patched", False):
             continue
@@ -94,10 +83,27 @@ def patch_expert_linears_for_grad(expert_stack: Any) -> list[Any]:
         patched.append(mod)
     if patched:
         logger.info(
-            "Patched %d expert Linear(s) to F.linear for autograd.",
+            "Patched %d %s Linear(s) to F.linear for autograd.",
             len(patched),
+            log_label,
         )
     return patched
+
+
+def patch_expert_linears_for_grad(expert_stack: Any) -> list[Any]:
+    """Route expert-stack linears through ``F.linear`` when grad is needed.
+
+    FlashInfer GEMM (the default phyai linear backend) has no autograd.  During
+    the Fisher / sensitivity passes the expert stack is still full-precision, so
+    without this patch gradients stop at the first ``qkv_proj`` and every DiT
+    layer reports zero Fisher sensitivity.
+    """
+    return _patch_linears_for_grad(expert_stack, log_label="expert")
+
+
+def patch_llm_linears_for_grad(paligemma_lm: Any) -> list[Any]:
+    """Route paligemma prefix linears through ``F.linear`` when grad is needed."""
+    return _patch_linears_for_grad(paligemma_lm, log_label="LLM")
 
 
 def restore_expert_linears_for_grad(patched: list[Any]) -> None:
@@ -111,7 +117,7 @@ def patch_expert_norms_for_grad(scheduler: Any) -> list[Any]:
     """Switch expert AdaRMSNorm kernels to the torch reference when grad is needed.
 
     The default ``phyai-kernel`` Triton path has no autograd, which disconnects
-    the DiT stack even when attention STE and action-head patches are active.
+    the DiT stack even when attention and action-head patches are active.
     """
     from phyai.layers.layer_norm import AdaRMSNorm, _torch_adarmsnorm
 
@@ -143,6 +149,52 @@ def _gelu_tanh_and_mul_torch(fused: torch.Tensor) -> torch.Tensor:
     return F.gelu(gate, approximate="tanh") * up
 
 
+def _torch_gemma_rmsnorm(
+    x: torch.Tensor, weight: torch.Tensor, eps: float
+) -> torch.Tensor:
+    needs_reshape = x.dim() != 2
+    if needs_reshape:
+        orig_shape = x.shape
+        x = x.contiguous().reshape(-1, orig_shape[-1])
+    var = x.pow(2).mean(dim=-1, keepdim=True)
+    out = x * torch.rsqrt(var + eps) * (1.0 + weight)
+    if needs_reshape:
+        out = out.reshape(orig_shape)
+    return out
+
+
+def _patch_mlp_activations_for_grad(root: nn.Module, *, log_label: str) -> list[Any]:
+    from phyai.layers.mlp.dense_mlp import DenseMLP
+
+    patched: list[Any] = []
+    for mod in root.modules():
+        if not isinstance(mod, DenseMLP) or not mod.gated or mod._act_and_mul is None:
+            continue
+        if getattr(mod, "_qvla_act_patched", False):
+            continue
+        orig_act = mod._act_and_mul
+
+        def make_act(original):
+            def act_and_mul(fused: torch.Tensor) -> torch.Tensor:
+                if torch.is_grad_enabled():
+                    return _gelu_tanh_and_mul_torch(fused)
+                return original(fused)
+
+            return act_and_mul
+
+        mod._qvla_orig_act_and_mul = orig_act  # type: ignore[attr-defined]
+        mod._act_and_mul = make_act(orig_act)
+        mod._qvla_act_patched = True
+        patched.append(mod)
+    if patched:
+        logger.info(
+            "Patched %d %s DenseMLP activation(s) to torch backend.",
+            len(patched),
+            log_label,
+        )
+    return patched
+
+
 def patch_rope_for_grad(rope: Any) -> Any | None:
     """Use eager RoPE when autograd is needed (flashinfer has no backward)."""
     if getattr(rope, "_qvla_rope_grad_patched", False):
@@ -170,34 +222,12 @@ def restore_rope_for_grad(rope: Any | None) -> None:
 
 def patch_expert_mlp_activations_for_grad(expert_stack: Any) -> list[Any]:
     """Route GeGLU through torch when grad is needed (flashinfer has no backward)."""
-    from phyai.layers.mlp.dense_mlp import DenseMLP
+    return _patch_mlp_activations_for_grad(expert_stack, log_label="expert")
 
-    patched: list[Any] = []
-    for mod in expert_stack.modules():
-        if not isinstance(mod, DenseMLP) or not mod.gated or mod._act_and_mul is None:
-            continue
-        if getattr(mod, "_qvla_act_patched", False):
-            continue
-        orig_act = mod._act_and_mul
 
-        def make_act(original):
-            def act_and_mul(fused: torch.Tensor) -> torch.Tensor:
-                if torch.is_grad_enabled():
-                    return _gelu_tanh_and_mul_torch(fused)
-                return original(fused)
-
-            return act_and_mul
-
-        mod._qvla_orig_act_and_mul = orig_act  # type: ignore[attr-defined]
-        mod._act_and_mul = make_act(orig_act)
-        mod._qvla_act_patched = True
-        patched.append(mod)
-    if patched:
-        logger.info(
-            "Patched %d expert DenseMLP activation(s) to torch backend.",
-            len(patched),
-        )
-    return patched
+def patch_llm_mlp_activations_for_grad(paligemma_lm: Any) -> list[Any]:
+    """Route paligemma GeGLU through torch when grad is needed."""
+    return _patch_mlp_activations_for_grad(paligemma_lm, log_label="LLM")
 
 
 def restore_expert_mlp_activations_for_grad(patched: list[Any]) -> None:
@@ -207,104 +237,76 @@ def restore_expert_mlp_activations_for_grad(patched: list[Any]) -> None:
             mod._qvla_act_patched = False
 
 
-def _gated_residual(residual: torch.Tensor, out: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
-    """``residual + out * gate`` with the skip path stopped for autograd."""
-    if _tensor_in_autograd_graph(residual) or _tensor_in_autograd_graph(out):
-        return torch.addcmul(residual.detach(), out, gate)
-    return torch.addcmul(residual, out, gate)
-
-
-def patch_expert_gated_residuals_for_grad(expert_stack: Any) -> list[Any]:
-    """Stop gated residuals from carrying gradients around quantized sublayers."""
-    from phyai.models.pi05.modeling_pi05 import PI05ExpertLayer
+def patch_llm_norms_for_grad(scheduler: Any) -> list[Any]:
+    """Switch paligemma RMSNorm kernels to torch when grad is needed."""
+    from phyai.layers.layer_norm import GemmaRMSNorm
 
     patched: list[Any] = []
-    for layer in expert_stack.layers:
-        if not isinstance(layer, PI05ExpertLayer):
+    for mod in scheduler.llm_runner.paligemma_lm.modules():
+        if not isinstance(mod, GemmaRMSNorm):
             continue
-        if getattr(layer, "_qvla_residual_patched", False):
+        if getattr(mod, "_qvla_torch_rms_patched", False):
             continue
-        orig_forward = layer.forward
-
-        def make_forward(lyr: PI05ExpertLayer):
-            def forward(
-                h: torch.Tensor,
-                position_ids: torch.Tensor,
-                cond: torch.Tensor | None,
-                rope: Any,
-                attn_ctx: Any,
-                *,
-                modulation: Any | None = None,
-            ) -> torch.Tensor:
-                residual = h
-                if modulation is None:
-                    n, gate_attn = lyr.input_layernorm(h, cond)
-                else:
-                    n, gate_attn = lyr.input_layernorm(
-                        h, modulation=modulation.input_ln
-                    )
-                fused, _ = lyr.qkv_proj(n)
-                q, k, v = lyr._split_qkv(fused, h.shape[:-1])
-                q, k = rope(position_ids, q, k)
-                attn_out = lyr.attn(q, k, v, attn_ctx)
-                attn_flat = attn_out.reshape(*attn_out.shape[:-2], -1)
-                out, _ = lyr.o_proj(attn_flat)
-                h = _gated_residual(residual, out, gate_attn)
-                residual = h
-                if modulation is None:
-                    m, gate_mlp = lyr.post_attention_layernorm(h, cond)
-                else:
-                    m, gate_mlp = lyr.post_attention_layernorm(
-                        h, modulation=modulation.post_attention_ln
-                    )
-                m = lyr.mlp(m)
-                return _gated_residual(residual, m, gate_mlp)
-
-            return forward
-
-        layer._qvla_orig_forward = orig_forward  # type: ignore[attr-defined]
-        layer.forward = make_forward(layer)  # type: ignore[method-assign]
-        layer._qvla_residual_patched = True
-        patched.append(layer)
+        mod._qvla_orig_rmsnorm = mod._rmsnorm  # type: ignore[attr-defined]
+        mod._rmsnorm = _torch_gemma_rmsnorm
+        mod._qvla_torch_rms_patched = True
+        patched.append(mod)
     if patched:
-        logger.info(
-            "Patched %d expert layer(s) to block gated-residual grad shortcuts.",
-            len(patched),
-        )
+        logger.info("Patched %d LLM GemmaRMSNorm module(s) to torch backend.", len(patched))
     return patched
 
 
-def restore_expert_gated_residuals_for_grad(patched: list[Any]) -> None:
-    for layer in patched:
-        if getattr(layer, "_qvla_residual_patched", False):
-            layer.forward = layer._qvla_orig_forward  # type: ignore[method-assign]
-            layer._qvla_residual_patched = False
+def restore_llm_norms_for_grad(patched: list[Any]) -> None:
+    for mod in patched:
+        if getattr(mod, "_qvla_torch_rms_patched", False):
+            mod._rmsnorm = mod._qvla_orig_rmsnorm  # type: ignore[attr-defined]
+            mod._qvla_torch_rms_patched = False
+
+
+def patch_llm_ops_for_grad(scheduler: Any) -> tuple[Any | None, list[Any], list[Any], list[Any]]:
+    """Patch paligemma prefix linears, norms, MLP activations, and RoPE for autograd."""
+    lm = scheduler.llm_runner.paligemma_lm
+    return (
+        patch_rope_for_grad(scheduler.llm_runner.rope),
+        patch_llm_linears_for_grad(lm),
+        patch_llm_norms_for_grad(scheduler),
+        patch_llm_mlp_activations_for_grad(lm),
+    )
+
+
+def restore_llm_ops_for_grad(
+    rope: Any | None,
+    linears: list[Any],
+    norms: list[Any],
+    mlps: list[Any],
+) -> None:
+    restore_rope_for_grad(rope)
+    restore_expert_linears_for_grad(linears)
+    restore_llm_norms_for_grad(norms)
+    restore_expert_mlp_activations_for_grad(mlps)
 
 
 def patch_expert_ops_for_grad(
     scheduler: Any,
-) -> tuple[Any | None, list[Any], list[Any], list[Any], list[Any]]:
-    """Patch RoPE, linears, norms, MLP activations, and gated residuals for autograd."""
+) -> tuple[Any | None, list[Any], list[Any], list[Any]]:
+    """Patch RoPE, linears, norms, and MLP activations for autograd."""
     stack = scheduler.expert_runner.expert_stack
     rope = patch_rope_for_grad(scheduler.expert_runner.rope)
     norms = patch_expert_norms_for_grad(scheduler)
     linears = patch_expert_linears_for_grad(stack)
     mlps = patch_expert_mlp_activations_for_grad(stack)
-    residuals = patch_expert_gated_residuals_for_grad(stack)
-    return rope, norms, mlps, residuals, linears
+    return rope, norms, mlps, linears
 
 
 def restore_expert_ops_for_grad(
     rope: Any | None,
     norms: list[Any],
     mlps: list[Any],
-    residuals: list[Any],
     linears: list[Any] | None = None,
 ) -> None:
     restore_rope_for_grad(rope)
     restore_expert_norms_for_grad(norms)
     restore_expert_mlp_activations_for_grad(mlps)
-    restore_expert_gated_residuals_for_grad(residuals)
     restore_expert_linears_for_grad(linears or [])
 
 
@@ -312,19 +314,21 @@ def restore_expert_ops_for_grad(
 def differentiable_inference_context(scheduler: Any) -> Iterator[None]:
     """Patch pi0.5 runners for one Fisher / differentiable calibration pass.
 
-    Installs attention STE, ``F.linear`` fallbacks on expert linears, and the
+    Installs eager attention on LLM + expert, ``F.linear`` fallbacks, and the
     other autograd shims required by :func:`differentiable_step`. Restores all
     patches on exit.
     """
-    attn = patch_attention_ste(scheduler)
+    attn = patch_attention_for_grad(scheduler, llm=True, expert=True)
     heads = patch_action_heads_for_grad(scheduler)
-    ops = patch_expert_ops_for_grad(scheduler)
+    llm_ops = patch_llm_ops_for_grad(scheduler)
+    expert_ops = patch_expert_ops_for_grad(scheduler)
     try:
         yield
     finally:
-        restore_attention_ste(attn)
+        restore_attention_for_grad(attn)
         restore_action_heads_for_grad(heads)
-        restore_expert_ops_for_grad(*ops)
+        restore_llm_ops_for_grad(*llm_ops)
+        restore_expert_ops_for_grad(*expert_ops)
 
 
 def patch_action_heads_for_grad(scheduler: Any) -> tuple[Any, Any, Any] | None:
@@ -483,11 +487,16 @@ def differentiable_step(
     if lang_embs.dtype != dtype:
         lang_embs = lang_embs.to(dtype)
     packed = _pack_prefix_diff(scheduler, image_embs, lang_embs, layout)
-    attach_sensitivity_metadata(
+    if torch.is_grad_enabled():
+        # Prefix embeddings are built outside the noise leaf; reconnect the LLM
+        # prefill stack so Fisher can backprop from actions through prefix KV tape.
+        packed = packed.detach().requires_grad_(True)
+    attach_attention_metadata(
         scheduler,
         prefix_meta=layout.prefix_meta,
         joint_meta=layout.joint_meta,
     )
+    clear_prefix_kv_tape(scheduler.kv_pool)
 
     if plan_changed:
         scheduler.prefix_static.reset()
@@ -544,13 +553,14 @@ def differentiable_step(
 def reset_differentiable_state(scheduler: Any) -> None:
     """Clear shared autograd state between sensitivity forward+backward passes.
 
-    The attention STE surrogate scatters K/V into the scheduler's
+    Expert attention writes K/V into the scheduler's
     :class:`~phyai.cache.kv_cache_pool.KVCachePool` via in-place ``index_put_``.
     After ``loss.backward()`` those buffers can retain freed-graph references;
     reusing them on the next sample triggers "backward through the graph a
     second time". Replacing each buffer with a detached view breaks the link.
     """
     pool = scheduler.kv_pool
+    clear_prefix_kv_tape(pool)
     for layer_id in range(pool.num_layers):
         pool.k_buffers[layer_id] = pool.k_buffers[layer_id].detach()
         pool.v_buffers[layer_id] = pool.v_buffers[layer_id].detach()
@@ -565,6 +575,10 @@ __all__ = [
     "patch_expert_mlp_activations_for_grad",
     "patch_expert_norms_for_grad",
     "patch_expert_ops_for_grad",
+    "patch_llm_linears_for_grad",
+    "patch_llm_mlp_activations_for_grad",
+    "patch_llm_norms_for_grad",
+    "patch_llm_ops_for_grad",
     "patch_rope_for_grad",
     "reset_differentiable_state",
     "restore_action_heads_for_grad",
@@ -572,5 +586,6 @@ __all__ = [
     "restore_expert_mlp_activations_for_grad",
     "restore_expert_norms_for_grad",
     "restore_expert_ops_for_grad",
+    "restore_llm_ops_for_grad",
     "restore_rope_for_grad",
 ]

@@ -77,7 +77,8 @@ class LayerPack:
     # the runtime falls back to dynamic per-token quant.
     act_bits: int
     act_scale_mode: str            # "per_step" | "static" | "dynamic"
-    act_scale_table: torch.Tensor | None  # (num_steps, in_features) or (in_features,) or None
+    act_scale_table: torch.Tensor | None  # per_channel: (in_features,) or (num_steps, in_features);
+                                          # per_token: (num_tokens,) or (num_steps, num_tokens)
 
     # Optional bias (kept full-precision; tiny memory).
     bias: torch.Tensor | None
@@ -87,6 +88,7 @@ class LayerPack:
 
     # Free-form fork for future extensions without bumping format_version.
     extras: dict[str, Any] = field(default_factory=dict)
+    act_scale_granularity: str = "per_channel"  # "per_channel" | "per_token"
 
     def state_dict(self) -> dict:
         return {
@@ -102,6 +104,7 @@ class LayerPack:
             "rotation": self.rotation.state_dict(),
             "act_bits": self.act_bits,
             "act_scale_mode": self.act_scale_mode,
+            "act_scale_granularity": self.act_scale_granularity,
             "act_scale_table": (
                 self.act_scale_table.detach().contiguous().cpu()
                 if self.act_scale_table is not None
@@ -133,6 +136,7 @@ class LayerPack:
             rotation=Rotation.from_state_dict(sd["rotation"]),
             act_bits=int(sd["act_bits"]),
             act_scale_mode=sd["act_scale_mode"],
+            act_scale_granularity=sd.get("act_scale_granularity", "per_channel"),
             act_scale_table=sd.get("act_scale_table"),
             bias=sd.get("bias"),
             residual=sd.get("residual"),

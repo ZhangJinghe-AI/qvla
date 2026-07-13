@@ -94,6 +94,7 @@ class QuantLinear(nn.Module):
         self.group_size = pack.group_size
         self.scope = pack.scope
         self.act_scale_mode = pack.act_scale_mode
+        self.act_scale_granularity = pack.act_scale_granularity
         self.name = pack.name
 
         self._flags = _RuntimeFlags(
@@ -238,6 +239,7 @@ class QuantLinear(nn.Module):
             f"weight_bits={self.weight_bits}, act_bits={self.act_bits}, "
             f"group_size={self.group_size}, scope={self.scope}, "
             f"act_scale_mode={self.act_scale_mode}, "
+            f"act_scale_granularity={self.act_scale_granularity}, "
             f"rotation_pipeline={','.join(self._rotation_pipeline) or 'none'}, "
             f"has_perm={self._has_perm}, "
             f"has_residual={self._has_residual}"
@@ -268,32 +270,58 @@ class QuantLinear(nn.Module):
             random_hadamard_blocks=random_hadamard_blocks,
         )
 
+    def _broadcast_per_token_scale(
+        self, calibrated: torch.Tensor, x_rot: torch.Tensor
+    ) -> torch.Tensor:
+        """Expand calibrated per-token scales to ``x_rot``'s token axis.
+
+        Packs are typically calibrated at ``B=1`` so the table length equals
+        ``chunk_size``. PhyAI's expert runner flattens to ``(B * chunk_size, K)``
+        in sample-major order, so when the runtime token count is an integer
+        multiple of the table length we repeat the calibrated scales once per
+        batch item (token ``i`` in every sample shares ``calibrated[i]``).
+        """
+        t = int(x_rot.shape[-2])
+        calibrated = calibrated.reshape(-1)
+        n = int(calibrated.numel())
+        if t == n:
+            scales = calibrated
+        elif t > n and t % n == 0:
+            scales = calibrated.repeat(t // n)
+        elif t < n:
+            scales = calibrated[:t]
+        else:
+            raise RuntimeError(
+                f"QuantLinear({self.name}): per_token act_scale_table length "
+                f"{n} cannot broadcast to runtime tokens {t}. Use "
+                f"max_batch_size so B*chunk_size is {n} or a multiple of {n}, "
+                f"rebuild with act_scale_granularity=per_channel, or rebuild "
+                f"the pack at the serve batch size."
+            )
+        return scales.view(*((1,) * (x_rot.ndim - 2)), -1, 1)
+
     def _activation_scale(self, x_rot: torch.Tensor) -> torch.Tensor:
-        """Return a per-token (last-axis) scale in float32.
+        """Return activation scale in float32.
 
-        Three modes:
-
-        * ``dynamic``  — per-token amax / qmax. Most accurate, costs one extra
-                         reduction.
-        * ``static``   — per-channel scale from ``act_scale_table``. Fastest.
-        * ``per_step`` — index into ``act_scale_table[step]`` using the layer's
-                         own call counter modulo ``num_steps``.
-
-        For ``static`` / ``per_step`` modes we return a row-shaped scale that
-        the caller broadcasts; the scale itself is amax-aligned with the
-        configured percentile (built offline).
+        ``dynamic`` uses runtime per-token amax. ``static`` / ``per_step`` use
+        the offline table: per-channel rows are ``(1, in_features)``;
+        per-token rows are ``(num_tokens, 1)``.
         """
         if self.act_scale_mode == "dynamic" or not self._has_scale_table:
             amax = x_rot.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12)
             return (amax / self._act_qmax).to(torch.float32)
 
         if self.act_scale_mode == "static":
+            if self.act_scale_granularity == "per_token":
+                return self._broadcast_per_token_scale(self.act_scale_table, x_rot)
             return self.act_scale_table.view(1, -1)
 
-        # per_step
         step = self._step_counter % self._num_steps
-        # Increment *after* indexing so a freshly-reset counter reads slot 0.
         self._step_counter += 1
+        if self.act_scale_granularity == "per_token":
+            return self._broadcast_per_token_scale(
+                self.act_scale_table[step], x_rot
+            )
         return self.act_scale_table[step].view(1, -1)
 
     def _quantize_activation(

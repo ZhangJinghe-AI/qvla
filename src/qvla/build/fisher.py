@@ -108,6 +108,7 @@ class FisherCollector:
 
         # name -> [(step_key, activation_tensor)] for the current sample
         self._sample_acts: dict[str, list[tuple[int | None, torch.Tensor]]] = {}
+        self._warned_no_grad: set[str] = set()
 
         for name, scope, mod in targets:
             self._scopes[name] = scope
@@ -133,7 +134,6 @@ class FisherCollector:
                 return
             if not torch.is_grad_enabled():
                 return
-            # Only capture tensors in the autograd graph
             if not (x.requires_grad or x.grad_fn is not None):
                 return
             x.retain_grad()
@@ -209,10 +209,26 @@ class FisherCollector:
             for name, step_acts in self._sample_acts.items():
                 result = self._results[name]
                 for step, x in step_acts:
-                    if x.grad is None:
+                    grad_x = x.grad
+                    if grad_x is None:
+                        # e.g. pi0.5 last LLM layer o_proj/MLP: prefix prefill
+                        # writes K/V before them and discards the final hidden state.
+                        if name not in self._warned_no_grad:
+                            logger.info(
+                                "Layer %r (step=%r) not on the action graph; "
+                                "Fisher sensitivity stays zero.",
+                                name,
+                                step,
+                            )
+                            self._warned_no_grad.add(name)
+                        if step not in result._step_accum:
+                            result._step_accum[step] = torch.zeros(
+                                result.in_features,
+                                device=x.device,
+                                dtype=torch.float32,
+                            )
                         continue
-                    grad_sq = x.grad.detach().float().pow(2)
-                    # Average over all dims except the channel (last) dim
+                    grad_sq = grad_x.detach().float().pow(2)
                     reduce = list(range(grad_sq.ndim - 1))
                     ch_sens = grad_sq.mean(dim=reduce) if reduce else grad_sq
                     if step not in result._step_accum:
@@ -266,11 +282,11 @@ def compute_fisher_sensitivity(
     each layer name to its aggregated ``(in_features,)`` sensitivity
     vector.
 
-    Only layers whose activations participate in the autograd graph
-    (typically DiT layers connected through the noise leaf) will have
-    non-zero sensitivity.  LLM layers whose prefix path is detached
-    will have zero sensitivity — they fall back to vanilla
-    ``svd_hadamard`` rotation at build time.
+    Layers whose inputs are not connected to actions (e.g. the last LLM layer's
+    ``o_proj`` and MLP in pi0.5 prefix prefill) receive zero sensitivity.
+    Other LLM and DiT linears are patched for autograd; prefix K/V from the
+    paligemma prefill are replayed from a per-layer tape so expert joint
+    attention can backprop into earlier LLM activations.
     """
     from qvla.build.differentiable_forward import (
         force_eager_runners,
@@ -328,10 +344,27 @@ def compute_fisher_sensitivity(
     n_nonzero = sum(
         1 for v in aggregated.values() if v.abs().sum().item() > 0
     )
+    n_llm = sum(1 for _, s, _ in target_modules if s == "llm")
+    n_dit = sum(1 for _, s, _ in target_modules if s == "dit")
+    n_llm_nz = sum(
+        1
+        for name, scope, _ in target_modules
+        if scope == "llm" and aggregated[name].abs().sum().item() > 0
+    )
+    n_dit_nz = sum(
+        1
+        for name, scope, _ in target_modules
+        if scope == "dit" and aggregated[name].abs().sum().item() > 0
+    )
     logger.info(
-        "Fisher sensitivity: %d / %d layers have non-zero sensitivity.",
+        "Fisher sensitivity: %d / %d layers have non-zero sensitivity "
+        "(LLM %d/%d, DiT %d/%d).",
         n_nonzero,
         len(aggregated),
+        n_llm_nz,
+        n_llm,
+        n_dit_nz,
+        n_dit,
     )
     return aggregated
 

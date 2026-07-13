@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 
 import numpy as np
 import torch
@@ -84,11 +85,17 @@ class PI05Adapter(ModelAdapter):
         batch: dict,
         *,
         step_callback,
+        sample_index: int | None = None,
     ) -> None:
         del model
         self._ensure_processor()
         assert self._engine is not None
         request = build_pi05_request(self._processor, batch, state_dim=self.cfg.state_dim)
+        from qvla.build.calibration_noise import calibration_noise_for_sample_if_enabled
+
+        noise = calibration_noise_for_sample_if_enabled(self, sample_index)
+        if noise is not None:
+            request = replace(request, noise=noise)
         runner = find_expert_runner(self._engine)
         with patched_one_step(runner, step_callback):
             step_callback(None)

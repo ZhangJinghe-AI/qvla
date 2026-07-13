@@ -90,8 +90,8 @@ def test_perm_after_rotation_uses_rotated_weight():
 
     _, score = compute_perm_energy(w, perm_score="weight")
     assert score == "weight"
-    perm_original = zigzag_permutation((w * w).mean(dim=0))
-    perm_after_svd = zigzag_permutation((w_after_svd * w_after_svd).mean(dim=0))
+    perm_original = zigzag_permutation((w * w).mean(dim=0), block_size=16)
+    perm_after_svd = zigzag_permutation((w_after_svd * w_after_svd).mean(dim=0), block_size=16)
     assert not torch.equal(perm_original, perm_after_svd)
 
     via_pipeline = apply_weight_pipeline(w, ("svd", "perm", "hadamard"), block_size=16)
@@ -118,10 +118,12 @@ def test_act_perm_after_svd_uses_rotated_activation_amax():
     amax_after_svd = x_after_svd.abs().amax(dim=0)
 
     perm_wrong = zigzag_permutation(
-        compute_perm_energy(w_after_svd, perm_score="activation", activation_amax=amax_raw)[0]
+        compute_perm_energy(w_after_svd, perm_score="activation", activation_amax=amax_raw)[0],
+        block_size=16,
     )
     perm_right = zigzag_permutation(
-        compute_perm_energy(w_after_svd, perm_score="activation", activation_amax=amax_after_svd)[0]
+        compute_perm_energy(w_after_svd, perm_score="activation", activation_amax=amax_after_svd)[0],
+        block_size=16,
     )
     assert not torch.equal(perm_wrong, perm_right)
 
@@ -136,6 +138,17 @@ def test_act_perm_after_svd_uses_rotated_activation_amax():
     blocks_h = _hadamard_blocks(w_wrong.shape[1], 16, device=w_wrong.device)
     w_wrong = _apply_block_matmul(w_wrong, blocks_h, 16)
     assert not torch.allclose(via_pipeline, w_wrong, atol=1e-4)
+
+
+def test_zigzag_permutation_assigns_across_blocks():
+    """Largest channel goes to block0 slot0, 2nd largest to block1 slot0, etc."""
+    from qvla.core.rotation import zigzag_permutation
+
+    energy = torch.arange(8, dtype=torch.float32)
+    perm = zigzag_permutation(energy, block_size=4)
+    assert perm[0] == 7
+    assert perm[4] == 6
+    assert perm.tolist() == [7, 4, 3, 0, 6, 5, 2, 1]
 
 
 def test_perm_svd_h_reduces_outliers():

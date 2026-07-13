@@ -105,12 +105,12 @@ def test_act_percentile_mode_override():
         [
             "--checkpoint", "/ckpt",
             "--output", "/out.pt",
-            "--dit-act-percentile-mode", "inner_channel",
+            "--dit-act-percentile-mode", "inner",
         ]
     )
     cfg = build_pi05_pack.build_config_from_args(args)
-    assert cfg.dit.act_percentile_mode == "inner_channel"
-    assert cfg.llm.act_percentile_mode == "cross_channel"
+    assert cfg.dit.act_percentile_mode == "inner"
+    assert cfg.llm.act_percentile_mode == "cross"
 
 
 def test_svd_source_activation_override():

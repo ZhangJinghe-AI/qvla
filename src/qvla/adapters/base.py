@@ -69,6 +69,7 @@ class ModelAdapter(ABC):
         batch: dict,
         *,
         step_callback,
+        sample_index: int | None = None,
     ) -> None:
         """Run one calibration inference end-to-end.
 

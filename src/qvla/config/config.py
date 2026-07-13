@@ -17,6 +17,8 @@ Design choices kept deliberately narrow:
   ``hadamard``, ``random_hadamard`` (empty = no rotation).
 * `act_scale_mode` ∈ {"per_step", "static", "dynamic"} — only the DiT side
   has a meaningful step axis; the LLM side coerces to "static" / "dynamic".
+* `act_scale_granularity` ∈ {"per_channel", "per_token"} — for static /
+  per_step only; dynamic is always per-token.
 """
 
 from __future__ import annotations
@@ -28,7 +30,8 @@ from typing import Literal
 
 WeightQuantizer = Literal["gptq", "rtn", "rtn_residual"]
 ActScaleMode = Literal["per_step", "static", "dynamic"]
-ActPercentileMode = Literal["inner_channel", "cross_channel"]
+ActScaleGranularity = Literal["per_channel", "per_token"]
+ActPercentileMode = Literal["inner", "cross"]
 StepAggregation = Literal["uniform"]
 PermScore = Literal["weight", "activation", "activation_weight", "fisher"]
 SvdSource = Literal["weight", "activation"]
@@ -75,10 +78,11 @@ class ScopeConfig:
     # int4 by default; 16 means keep full precision (no activation quant).
     act_bits: int = 4
     act_scale_mode: ActScaleMode = "dynamic"
+    act_scale_granularity: ActScaleGranularity = "per_channel"
     act_percentile: float = 99.9  # for static / per-step
-    # ``inner_channel``: per-channel percentile over all tokens;
-    # ``cross_channel``: legacy global cap on per-channel maxes.
-    act_percentile_mode: ActPercentileMode = "cross_channel"
+    # ``inner``: per-dimension percentile over activation samples;
+    # ``cross``: global cap on per-dimension maxes.
+    act_percentile_mode: ActPercentileMode = "cross"
 
     # Number of denoise steps; only relevant for `per_step`. 1 collapses to static.
     num_steps: int = 1
@@ -274,6 +278,7 @@ class QVLAConfig:
 
 __all__ = [
     "ActPercentileMode",
+    "ActScaleGranularity",
     "ActScaleMode",
     "DEFAULT_PIPELINE",
     "QVLAConfig",

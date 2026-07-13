@@ -49,6 +49,7 @@ from qvla.adapters import get_adapter  # noqa: E402
 from qvla.build import build_pack  # noqa: E402
 from qvla.config import (  # noqa: E402
     ActPercentileMode,
+    ActScaleGranularity,
     ActScaleMode,
     DEFAULT_PIPELINE,
     QVLAConfig,
@@ -62,9 +63,13 @@ from qvla.runtime import list_target_modules  # noqa: E402
 _SUBCOMMANDS = frozenset({"build", "debug-regex"})
 _WEIGHT_QUANT_CHOICES: tuple[WeightQuantizer, ...] = ("gptq", "rtn", "rtn_residual")
 _ACT_SCALE_CHOICES: tuple[ActScaleMode, ...] = ("per_step", "static", "dynamic")
+_ACT_SCALE_GRANULARITY_CHOICES: tuple[ActScaleGranularity, ...] = (
+    "per_channel",
+    "per_token",
+)
 _ACT_PERCENTILE_MODE_CHOICES: tuple[ActPercentileMode, ...] = (
-    "inner_channel",
-    "cross_channel",
+    "inner",
+    "cross",
 )
 _STEP_AGG_CHOICES = ("uniform",)
 _PERM_SCORE_CHOICES: tuple[PermScore, ...] = (
@@ -104,6 +109,7 @@ def _scope_overrides(prefix: str, args: argparse.Namespace) -> dict:
         f"{prefix}_group_size": "group_size",
         f"{prefix}_act_bits": "act_bits",
         f"{prefix}_act_scale_mode": "act_scale_mode",
+        f"{prefix}_act_scale_granularity": "act_scale_granularity",
         f"{prefix}_act_percentile": "act_percentile",
         f"{prefix}_act_percentile_mode": "act_percentile_mode",
         f"{prefix}_rotation_block_size": "rotation_block_size",
@@ -267,6 +273,16 @@ def _add_scope_args(
         dest=f"{prefix}_act_scale_mode",
     )
     g.add_argument(
+        f"--{prefix}-act-scale-granularity",
+        choices=_ACT_SCALE_GRANULARITY_CHOICES,
+        default=None,
+        dest=f"{prefix}_act_scale_granularity",
+        help=(
+            "Activation scale granularity for static / per_step: "
+            "per_channel (default) or per_token."
+        ),
+    )
+    g.add_argument(
         f"--{prefix}-act-percentile",
         type=float,
         default=None,
@@ -280,8 +296,8 @@ def _add_scope_args(
         dest=f"{prefix}_act_percentile_mode",
         help=(
             "How to apply act_percentile for static / per_step scales: "
-            "inner_channel (per-channel token distribution) or "
-            "cross_channel (legacy cap on per-channel maxes)."
+            "inner (per-dimension sample percentile) or "
+            "cross (global cap on per-dimension maxes)."
         ),
     )
     g.add_argument(

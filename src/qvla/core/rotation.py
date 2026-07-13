@@ -128,7 +128,7 @@ def _random_hadamard_blocks(
     dtype: torch.dtype = torch.float32,
     seed: int | None = None,
 ) -> torch.Tensor:
-    generator = torch.Generator()
+    generator = torch.Generator(device=device)
     if seed is not None:
         generator.manual_seed(seed)
     h = random_hadamard_matrix(
@@ -307,11 +307,14 @@ def hadamard_rotation(d: int, block_size: int, *, device=None) -> Rotation:
     )
 
 
-def zigzag_permutation(energy: torch.Tensor) -> torch.Tensor:
-    """DuQuant zigzag channel reorder from per-channel energy (descending sort).
+def zigzag_permutation_omega_qvla(energy: torch.Tensor) -> torch.Tensor:
+    """Omega-QVLA global interleave permutation (debug / legacy reference).
 
-    High-energy channels are assigned to blocks in a back-and-forth pattern so
-    each block receives a similar outlier budget.
+    Matches ``zigzag_permutation`` in Omega-QVLA ``gr00t/quantization/duquant_preprocess.py``:
+    sort channels by energy descending, then alternate picking from the largest
+    and smallest ends of the sorted list (slot 0 = max, slot 1 = min, …).
+
+    Not wired into production pipelines; kept for debugging against Omega-QVLA packs.
     """
     if energy.ndim != 1:
         raise ValueError(f"energy must be 1-D, got shape {tuple(energy.shape)}.")
@@ -329,6 +332,55 @@ def zigzag_permutation(energy: torch.Tensor) -> torch.Tensor:
             right -= 1
         toggle = not toggle
     return torch.tensor(perm, dtype=torch.int64, device=energy.device)
+
+
+def zigzag_permutation(energy: torch.Tensor, *, block_size: int) -> torch.Tensor:
+    """DuQuant zigzag channel reorder from per-channel energy (descending sort).
+
+    Sorted channels are assigned to blocks in a back-and-forth pattern (block 0,
+    1, …, K-1, K-2, …); within each block, higher-energy channels occupy earlier
+    slots.  Matches ``Quantizer.permutation_zigzag`` in the official DuQuant repo.
+    """
+    if energy.ndim != 1:
+        raise ValueError(f"energy must be 1-D, got shape {tuple(energy.shape)}.")
+    n = energy.numel()
+    if n % block_size != 0:
+        raise ValueError(
+            f"energy length {n} must be divisible by block_size {block_size}."
+        )
+    num_blocks = n // block_size
+
+    order = torch.argsort(energy, descending=True)
+    sorted_pairs: list[tuple[int, float]] = [
+        (int(order[i].item()), float(energy[order[i]].item())) for i in range(n)
+    ]
+
+    blocks: list[list[tuple[int, float]]] = [[] for _ in range(num_blocks)]
+    cur = 0
+    up = True
+    for pair in sorted_pairs:
+        blocks[cur].append(pair)
+        if up:
+            cur += 1
+            if cur == num_blocks:
+                cur -= 1
+                up = False
+        else:
+            cur -= 1
+            if cur == -1:
+                cur += 1
+                up = True
+
+    perm = torch.empty(n, dtype=torch.int64, device=energy.device)
+    for block_idx, block_pairs in enumerate(blocks):
+        block_pairs.sort(key=lambda item: item[1], reverse=True)
+        start = block_idx * block_size
+        perm[start : start + block_size] = torch.tensor(
+            [ch for ch, _ in block_pairs],
+            dtype=torch.int64,
+            device=energy.device,
+        )
+    return perm
 
 
 def compute_perm_energy(
@@ -509,7 +561,7 @@ def _zigzag_from_stats(
         sensitivity=sensitivity,
         eps=eps,
     )
-    return zigzag_permutation(energy), score_used
+    return zigzag_permutation(energy, block_size=block_size), score_used
 
 
 def step_needs_activation_calibration(
@@ -598,7 +650,7 @@ class PipelineRotationBuild:
 
         if step == "perm":
             amax = (
-                stats.static_amax.to(device)
+                stats.static_channel_amax.to(device)
                 if stats is not None and stats.n_tokens > 0
                 else None
             )
