@@ -34,7 +34,7 @@ import analyze_dit_step_activations as dsa  # noqa: E402
 from qvla.adapters import get_adapter  # noqa: E402
 from qvla.adapters.pi05.obs import build_pi05_request  # noqa: E402
 from qvla.adapters.pi05.step_hook import patched_one_step  # noqa: E402
-from qvla.build.fisher import FisherCollector  # noqa: E402
+from qvla.build.fisher import FisherCollector, resolve_fisher_action_dim  # noqa: E402
 from qvla.config import QVLAConfig  # noqa: E402
 from qvla.runtime import list_target_modules  # noqa: E402
 
@@ -91,7 +91,14 @@ def _differentiable_forward(adapter, sched, batch: dict, *, noise: torch.Tensor 
 
 
 def _collect_fisher_per_step(
-    adapter, targets, batch: dict, *, num_dit_steps: int, noise: torch.Tensor | None,
+    adapter,
+    targets,
+    batch: dict,
+    *,
+    num_dit_steps: int,
+    noise: torch.Tensor | None,
+    fisher_method: str = "exact",
+    hutchinson_probes: int = 8,
 ) -> dict[str, dict[int, torch.Tensor]]:
     from qvla.build.differentiable_forward import (
         differentiable_inference_context,
@@ -106,7 +113,9 @@ def _collect_fisher_per_step(
     runner = sched.expert_runner
 
     with differentiable_inference_context(sched):
-        with FisherCollector(targets, num_dit_steps) as fc:
+        with FisherCollector(
+            targets, num_dit_steps, action_dim=resolve_fisher_action_dim(adapter)
+        ) as fc:
             fc.begin_sample()
             reset_differentiable_state(sched)
             reset_step_counters(model)
@@ -118,7 +127,12 @@ def _collect_fisher_per_step(
             with patched_one_step(runner, _step_cb):
                 fc.set_current_step(None)
                 actions = _differentiable_forward(adapter, sched, batch, noise=noise)
-            fc.compute_jacobian_sensitivity(actions, model=model)
+            fc.compute_jacobian_sensitivity(
+                actions,
+                model=model,
+                method=fisher_method,
+                hutchinson_probes=hutchinson_probes,
+            )
             results = fc.get_results()
 
     out: dict[str, dict[int, torch.Tensor]] = {}
@@ -390,11 +404,28 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--sample-index", type=int, default=0, help="Fixed calibration sample (default: 0).")
     p.add_argument("--fixed-noise-seed", type=int, default=0, help="Fixed diffusion noise (default: 0).")
     p.add_argument("--top-k", type=int, default=32, help="Top-k channels for overlap/coverage (default: 32).")
+    p.add_argument(
+        "--fisher-method",
+        choices=("exact", "hutchinson"),
+        default="exact",
+        help=(
+            "Fisher estimator: exact (one backward per action dim) or "
+            "hutchinson (random-projection approximation)."
+        ),
+    )
+    p.add_argument(
+        "--fisher-hutchinson-probes",
+        type=int,
+        default=8,
+        help="Number of random projections when --fisher-method=hutchinson.",
+    )
     p.add_argument("--output-dir", type=Path, default=_TOOLS / "img" / "fisher" / "dit_step")
     args = p.parse_args(argv)
 
     if args.calibration_source == "file" and args.calibration_data is None:
         p.error("--calibration-data is required when --calibration-source=file.")
+    if args.fisher_hutchinson_probes < 1:
+        p.error("--fisher-hutchinson-probes must be >= 1.")
 
     config = QVLAConfig.pi05_default()
     adapter_kwargs = {"checkpoint_path": args.checkpoint, "calibration_source": args.calibration_source}
@@ -409,10 +440,23 @@ def main(argv: list[str] | None = None) -> int:
     batch = _get_batch(adapter, args.sample_index)
     noise = _make_noise(adapter, args.fixed_noise_seed)
 
-    print(f"Fisher per-step: sample={args.sample_index}, noise_seed={args.fixed_noise_seed}, "
-          f"{len(targets)} DiT layer(s), {num_steps} steps")
+    print(
+        f"Fisher per-step: sample={args.sample_index}, noise_seed={args.fixed_noise_seed}, "
+        f"{len(targets)} DiT layer(s), {num_steps} steps, method={args.fisher_method}"
+        + (
+            f", probes={args.fisher_hutchinson_probes}"
+            if args.fisher_method == "hutchinson"
+            else ""
+        )
+    )
     fisher_map = _collect_fisher_per_step(
-        adapter, targets, batch, num_dit_steps=num_steps, noise=noise,
+        adapter,
+        targets,
+        batch,
+        num_dit_steps=num_steps,
+        noise=noise,
+        fisher_method=args.fisher_method,
+        hutchinson_probes=args.fisher_hutchinson_probes,
     )
 
     summaries = [_layer_summary(name, fisher_map[name]) for name in sorted(fisher_map)]

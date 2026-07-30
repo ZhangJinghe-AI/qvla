@@ -28,7 +28,7 @@ def build_pi05_engine(cfg: PI05AdapterConfig):
             plugin="pi05",
             plugin_args=PI05Args(
                 checkpoint_dir=cfg.checkpoint_path,
-                max_batch_size=1,
+                max_batch_size=cfg.max_batch_size,
                 vision_params_dtype=vision_params_dtype,
                 weight_remap=lerobot_weight_remap,
                 inputs_image_shape=[

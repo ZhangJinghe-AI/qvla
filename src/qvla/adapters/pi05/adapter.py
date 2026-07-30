@@ -86,6 +86,7 @@ class PI05Adapter(ModelAdapter):
         *,
         step_callback,
         sample_index: int | None = None,
+        noise_index: int = 0,
     ) -> None:
         del model
         self._ensure_processor()
@@ -93,7 +94,9 @@ class PI05Adapter(ModelAdapter):
         request = build_pi05_request(self._processor, batch, state_dim=self.cfg.state_dim)
         from qvla.build.calibration_noise import calibration_noise_for_sample_if_enabled
 
-        noise = calibration_noise_for_sample_if_enabled(self, sample_index)
+        noise = calibration_noise_for_sample_if_enabled(
+            self, sample_index, noise_index=noise_index
+        )
         if noise is not None:
             request = replace(request, noise=noise)
         runner = find_expert_runner(self._engine)
@@ -101,7 +104,14 @@ class PI05Adapter(ModelAdapter):
             step_callback(None)
             _ = self._engine.step(request)
 
-    def forward_differentiable(self, batch: dict) -> torch.Tensor:
+    def forward_differentiable(
+        self,
+        batch: list[dict],
+        *,
+        sample_indices: list[int] | None = None,
+        noise_index: int = 0,
+    ) -> torch.Tensor:
+        from qvla.build.calibration_noise import calibration_noise_for_sample_if_enabled
         from qvla.build.differentiable_forward import differentiable_step
         from qvla.runtime.step_context import reset_step_counters
 
@@ -111,9 +121,45 @@ class PI05Adapter(ModelAdapter):
         if sched is None:
             raise RuntimeError("pi05 scheduler not built; call build_model() first.")
 
+        obs_list = list(batch)
+        if not obs_list:
+            raise ValueError("forward_differentiable() got an empty batch list.")
+        if sample_indices is not None:
+            indices: list[int | None] = list(sample_indices)
+        else:
+            indices = [None] * len(obs_list)
+
+        if len(indices) != len(obs_list):
+            raise ValueError(
+                f"sample_indices length {len(indices)} != batch size {len(obs_list)}."
+            )
+        max_B = int(sched.max_batch_size)
+        if len(obs_list) > max_B:
+            raise RuntimeError(
+                f"Fisher/differentiable batch size {len(obs_list)} exceeds engine "
+                f"max_batch_size={max_B}. Rebuild with a larger max_batch_size "
+                "(pack build sets this from fisher_batch_size)."
+            )
+
         reset_step_counters(self._engine.entry.model)
-        request = build_pi05_request(self._processor, batch, state_dim=self.cfg.state_dim)
+        request = build_pi05_request(
+            self._processor, obs_list, state_dim=self.cfg.state_dim
+        )
         request.pixel_values = request.pixel_values.detach()
+
+        noises = [
+            calibration_noise_for_sample_if_enabled(
+                self, idx, noise_index=noise_index
+            )
+            for idx in indices
+        ]
+        if any(n is not None for n in noises):
+            if any(n is None for n in noises):
+                raise RuntimeError(
+                    "Calibration noise is installed but some sample_indices values "
+                    "in the batch are None; pass sample_indices for every slot."
+                )
+            request = replace(request, noise=torch.cat(noises, dim=0))
         return differentiable_step(sched, request)
 
     @property

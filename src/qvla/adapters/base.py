@@ -70,6 +70,7 @@ class ModelAdapter(ABC):
         *,
         step_callback,
         sample_index: int | None = None,
+        noise_index: int = 0,
     ) -> None:
         """Run one calibration inference end-to-end.
 
@@ -78,6 +79,9 @@ class ModelAdapter(ABC):
         any LLM-only / pre-prefix work. The builder hooks the callback up to
         the :class:`RotatedActivationCollector` so per-step stats land in the right
         bin.
+
+        ``noise_index`` selects which of the ``noise_ensemble_k`` diffusion
+        noises to use for this sample (pi0.5 calibration noise install).
         """
 
     def dit_step_count(self, config: QVLAConfig) -> int:
@@ -102,12 +106,23 @@ class ModelAdapter(ABC):
         """Underlying inference engine, or ``None`` before :meth:`build_model`."""
         return getattr(self, "_engine", None)
 
-    def forward_differentiable(self, batch: dict):
+    def forward_differentiable(
+        self,
+        batch: list[dict],
+        *,
+        sample_indices: list[int] | None = None,
+        noise_index: int = 0,
+    ):
         """Run one inference with autograd enabled; return differentiable actions.
 
         Required for Fisher sensitivity (``perm_score=fisher``). Subclasses that
         don't support differentiable inference should leave this unimplemented —
         the builder will raise when Fisher perm is requested.
+
+        ``batch`` is a non-empty list of observation dicts (Fisher micro-batch).
+        ``sample_indices`` / ``noise_index``
+        select the installed calibration diffusion noise when noise-ensemble
+        calibration is enabled.
 
         Returns:
             A :class:`torch.Tensor` connected to the autograd graph so that

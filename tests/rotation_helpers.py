@@ -67,7 +67,7 @@ def fit_rotation(
             ):
                 stats = LayerStats(in_features=d)
                 if step == "perm" and activation_amax is not None:
-                    stats.static_channel_amax = activation_amax.to(torch.float32)
+                    stats.static_cross_channel_amax = activation_amax.to(torch.float32)
                     stats.n_tokens = 1
                 elif step == "svd" and activation_cov is not None:
                     stats.xtx = activation_cov.to(torch.float64)

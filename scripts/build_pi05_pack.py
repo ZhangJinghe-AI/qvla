@@ -25,7 +25,9 @@ Examples::
         --dit-pipeline perm,svd,hadamard \\
         --dit-perm-score fisher \\
         --fisher-num-samples 4 \\
+        --fisher-batch-size 4 \\
         --fisher-step-aggregation uniform \\
+        --calibration-step-aggregation uniform \\
         -vv
 
     uv run python scripts/build_pi05_pack.py debug-regex \\
@@ -71,7 +73,13 @@ _ACT_PERCENTILE_MODE_CHOICES: tuple[ActPercentileMode, ...] = (
     "inner",
     "cross",
 )
-_STEP_AGG_CHOICES = ("uniform",)
+_FISHER_STEP_AGG_CHOICES = (
+    "uniform", "max", "late_mean", "very_late_mean", "weighted_linear"
+)
+_FISHER_METHOD_CHOICES = ("exact", "hutchinson")
+_CALIB_STEP_AGG_CHOICES = (
+    "uniform", "late_mean", "very_late_mean", "weighted_linear"
+)
 _PERM_SCORE_CHOICES: tuple[PermScore, ...] = (
     "weight",
     "activation",
@@ -117,6 +125,7 @@ def _scope_overrides(prefix: str, args: argparse.Namespace) -> dict:
         f"{prefix}_svd_source": "svd_source",
         f"{prefix}_gptq_damp_percent": "gptq_damp_percent",
         f"{prefix}_gptq_block_size": "gptq_block_size",
+        f"{prefix}_fisher_gptq": "fisher_gptq",
         f"{prefix}_include_regex": "include_regex",
         f"{prefix}_exclude_regex": "exclude_regex",
     }
@@ -158,8 +167,20 @@ def build_config_from_args(args: argparse.Namespace) -> QVLAConfig:
         top["fisher_num_samples"] = args.fisher_num_samples
     if getattr(args, "fisher_step_aggregation", None) is not None:
         top["fisher_step_aggregation"] = args.fisher_step_aggregation
+    if getattr(args, "calibration_step_aggregation", None) is not None:
+        top["calibration_step_aggregation"] = args.calibration_step_aggregation
+    if getattr(args, "fisher_action_timestep", None) is not None:
+        top["fisher_action_timestep"] = args.fisher_action_timestep
+    if getattr(args, "fisher_method", None) is not None:
+        top["fisher_method"] = args.fisher_method
+    if getattr(args, "fisher_hutchinson_probes", None) is not None:
+        top["fisher_hutchinson_probes"] = args.fisher_hutchinson_probes
+    if getattr(args, "fisher_batch_size", None) is not None:
+        top["fisher_batch_size"] = args.fisher_batch_size
     if getattr(args, "build_seed", None) is not None:
         top["build_seed"] = args.build_seed
+    if getattr(args, "noise_ensemble_k", None) is not None:
+        top["noise_ensemble_k"] = args.noise_ensemble_k
     return config.with_overrides(**top)
 
 
@@ -197,6 +218,8 @@ def _auto_output_path(args: argparse.Namespace, config: QVLAConfig) -> Path:
     _walk(base.to_dict(), config.to_dict())
     if args.num_samples != 10:
         tags.append(f"ns{args.num_samples}")
+    if getattr(args, "noise_ensemble_k", None) not in (None, 1):
+        tags.append(f"nk{args.noise_ensemble_k}")
     if args.calibration_source != "synthetic":
         tags.append(f"cal{args.calibration_source}")
     if tags:
@@ -238,7 +261,7 @@ def _add_scope_args(
     g.add_argument(
         f"--{prefix}-pipeline",
         type=parse_pipeline_string,
-        default=DEFAULT_PIPELINE,
+        default=None,
         dest=f"{prefix}_pipeline",
         metavar="STEPS",
         help=(
@@ -333,6 +356,16 @@ def _add_scope_args(
         dest=f"{prefix}_gptq_block_size",
     )
     g.add_argument(
+        f"--{prefix}-fisher-gptq",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        dest=f"{prefix}_fisher_gptq",
+        help=(
+            "Weight GPTQ Hessian by Fisher sensitivity so GPTQ protects "
+            "action-sensitive input columns. Requires --{}-quant gptq.".format(prefix)
+        ),
+    )
+    g.add_argument(
         f"--{prefix}-include-regex",
         default=None,
         dest=f"{prefix}_include_regex",
@@ -384,10 +417,63 @@ def _add_config_args(parser: argparse.ArgumentParser) -> None:
     )
     fisher.add_argument(
         "--fisher-step-aggregation",
-        choices=_STEP_AGG_CHOICES,
+        choices=_FISHER_STEP_AGG_CHOICES,
         default=None,
         dest="fisher_step_aggregation",
         help="How to aggregate per-step DiT Fisher sensitivity.",
+    )
+    top.add_argument(
+        "--calibration-step-aggregation",
+        choices=_CALIB_STEP_AGG_CHOICES,
+        default=None,
+        dest="calibration_step_aggregation",
+        help=(
+            "How to aggregate per-step DiT XᵀX (covariance / Hessian). "
+            "uniform: all steps equal (default). "
+            "late_mean: second half of denoise steps only. "
+            "very_late_mean: last fifth of denoise steps only. "
+            "weighted_linear: w(s) ∝ (s+1), later steps heavier."
+        ),
+    )
+    fisher.add_argument(
+        "--fisher-action-timestep",
+        default=None,
+        dest="fisher_action_timestep",
+        help=(
+            "Action-chunk timesteps for the Fisher Jacobian: "
+            "'all', one index (e.g. '50' as last for T=50), or comma-separated "
+            "indices (e.g. '0,29,50')."
+        ),
+    )
+    fisher.add_argument(
+        "--fisher-method",
+        choices=_FISHER_METHOD_CHOICES,
+        default=None,
+        dest="fisher_method",
+        help=(
+            "Fisher estimator: exact (one backward per action dim) or "
+            "hutchinson (random-projection approximation)."
+        ),
+    )
+    fisher.add_argument(
+        "--fisher-hutchinson-probes",
+        type=int,
+        default=None,
+        dest="fisher_hutchinson_probes",
+        help=(
+            "Number of random projections when --fisher-method=hutchinson "
+            "(default: 8)."
+        ),
+    )
+    fisher.add_argument(
+        "--fisher-batch-size",
+        type=int,
+        default=None,
+        dest="fisher_batch_size",
+        help=(
+            "Observations per Fisher differentiable forward (default: 4). "
+            "Raises the pi0.5 engine max_batch_size to at least this value."
+        ),
     )
     top.add_argument(
         "--build-seed",
@@ -397,6 +483,17 @@ def _add_config_args(parser: argparse.ArgumentParser) -> None:
         help=(
             "Seed for reproducible random Hadamard during build "
             "(per-layer seeds derived from this + layer name; default: 0)."
+        ),
+    )
+    top.add_argument(
+        "--noise-ensemble-k",
+        type=int,
+        default=None,
+        dest="noise_ensemble_k",
+        help=(
+            "Independent diffusion noises per calibration sample (default: 1). "
+            "Applied when calibrating DiT layers; LLM-only pipeline passes stay "
+            "at K=1. amax uses max, XᵀX / Hessian accumulate across noises."
         ),
     )
 
@@ -479,6 +576,20 @@ def _make_root_parser() -> argparse.ArgumentParser:
 
 
 def run_build(args: argparse.Namespace) -> int:
+    if args.noise_ensemble_k is not None and args.noise_ensemble_k < 1:
+        raise ValueError(f"--noise-ensemble-k must be >= 1, got {args.noise_ensemble_k}.")
+    if args.fisher_batch_size is not None and args.fisher_batch_size < 1:
+        raise ValueError(
+            f"--fisher-batch-size must be >= 1, got {args.fisher_batch_size}."
+        )
+    if (
+        args.fisher_hutchinson_probes is not None
+        and args.fisher_hutchinson_probes < 1
+    ):
+        raise ValueError(
+            "--fisher-hutchinson-probes must be >= 1, "
+            f"got {args.fisher_hutchinson_probes}."
+        )
     config = build_config_from_args(args)
     output_path = _auto_output_path(args, config)
     adapter = get_adapter("pi05", **build_adapter_kwargs(args))

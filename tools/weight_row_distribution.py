@@ -223,7 +223,7 @@ def _layer_stats_from_tokens(
     if stats.n_tokens == 0:
         raise ValueError("activation_tokens must contain at least one token.")
     if step == "perm":
-        stats.static_channel_amax = flat.abs().amax(dim=0).to(torch.float32)
+        stats.static_cross_channel_amax = flat.abs().amax(dim=0).to(torch.float32)
     elif step == "svd":
         stats.xtx = (flat.T @ flat).to(torch.float64)
     return stats

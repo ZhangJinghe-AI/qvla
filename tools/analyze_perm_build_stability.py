@@ -2,7 +2,7 @@
 """Perm index stability across calibration builds (no pack build required).
 
 Fits zigzag ``perm`` the same way as ``build_pi05_pack`` / ``PipelineRotationBuild``
-(activation ``static_channel_amax`` → ``zigzag_permutation``), then measures how often
+(activation ``static_cross_channel_amax`` → ``zigzag_permutation``), then measures how often
 repeated "builds" agree.
 
 Three heatmaps (linear layer × denoise step):

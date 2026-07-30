@@ -37,6 +37,7 @@ from qvla.core.quantize import (
     rtn_residual_quantize, symmetric_quant_range,
 )
 from qvla.build.collector import (
+    AmaxCollectPlan,
     LayerStats,
     RotatedActivationCollector,
 )
@@ -212,7 +213,7 @@ def test_activation_svd_after_perm_matches_direct_u_fit():
         svd_source="activation",
     )
     perm_stats = LayerStats(in_features=d)
-    perm_stats.static_channel_amax = amax
+    perm_stats.static_cross_channel_amax = amax
     perm_stats.n_tokens = X.shape[0]
     builder.fit_step(0, stats=perm_stats)
 
@@ -311,7 +312,7 @@ def test_no_quant_layer_forward_matches_fp_linear(tmp_path):
     K, N = 128, 64
     W = torch.randn(N, K) * 0.05
     W_store = W.to(torch.bfloat16)
-    qw = no_quantize(W_store, weight_bits=16)
+    qw = no_quantize(W_store)
     layer_pack = LayerPack(
         name="dit.layer",
         scope="dit",
@@ -484,9 +485,9 @@ def test_enable_quantization_replaces_and_forwards():
 # --------------------------------------------------------------------------- #
 
 
-def test_act_channel_percentile_amax_is_inner_not_cross():
+def test_act_channel_inner_amax_is_inner_not_cross():
     """Act scales use each channel's own value distribution, not a global cap."""
-    from qvla.build.collector import LayerStats
+    from qvla.build.collector import AmaxCollectPlan, LayerStats
     from qvla.core.quantize import (
         channel_percentile_amax,
         percentile_amax,
@@ -503,9 +504,15 @@ def test_act_channel_percentile_amax_is_inner_not_cross():
         dtype=torch.float32,
     )
     stats = LayerStats(in_features=2)
-    stats.static_abs_samples = [x.abs()]
+    stats.init_phase2(
+        2,
+        1,
+        "cpu",
+        amax_plan=AmaxCollectPlan(collect_inner_channel=True, inner_percentile=99.9),
+    )
+    stats.update_phase2(x, step=None)
 
-    per_ch = stats.act_channel_percentile_amax(99.9)
+    per_ch = stats.act_channel_inner_amax()
     expected = channel_percentile_amax(x.abs(), 99.9)
     assert torch.allclose(per_ch, expected, rtol=1e-5, atol=1e-5)
 
@@ -540,12 +547,15 @@ def test_rotated_act_scale_collector_matches_rotation_apply():
         {"layer": rot},
         num_steps_by_scope={"dit": 3},
         device="cpu",
+        amax_plan_by_scope={
+            "dit": AmaxCollectPlan(collect_cross_channel=True),
+        },
     ) as col:
         col.set_current_step(1)
         lin(x)
     h.remove()
 
-    collected = col.stats["layer"].per_step_channel_amax[1]
+    collected = col.stats["layer"].per_step_cross_channel_amax[1]
     assert torch.allclose(collected, manual, rtol=1e-5, atol=1e-5)
 
 

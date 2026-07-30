@@ -22,6 +22,7 @@ group size matches the block size (the common case).
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
 import torch
 
@@ -53,29 +54,34 @@ def percentile_amax(amax_row: torch.Tensor, percentile: float) -> torch.Tensor:
     return amax_row.clamp_max(q)
 
 
-def token_percentile_amax(row_amax: torch.Tensor, percentile: float) -> torch.Tensor:
-    """``percentile`` of per-token amax values (1-D tensor of row maxes)."""
-    if percentile >= 100.0:
-        return row_amax.max()
-    return torch.quantile(row_amax.to(torch.float32), percentile / 100.0)
+def _topk_percentile_along(
+    x: torch.Tensor, percentile: float, *, dim: int
+) -> torch.Tensor:
+    """Approximate ``percentile`` of ``x`` along ``dim`` via upper-tail ``topk``.
+
+    Cheaper than ``torch.quantile`` (no full sort / interpolation). For high
+    thresholds (e.g. 99.9) this is usually close enough for act-scale clipping.
+    """
+    n = int(x.shape[dim])
+    # k-th largest ≈ upper-tail percentile. For 99.9 with n=1000 → k=1 (max).
+    k = max(1, min(n, int(math.ceil((1.0 - percentile / 100.0) * n))))
+    return torch.topk(x, k=k, dim=dim, largest=True).values.select(dim, k - 1)
 
 
-def token_position_percentile_amax(
+def token_percentile_amax(
     abs_activations: torch.Tensor, percentile: float
 ) -> torch.Tensor:
-    """Per-token-position ``percentile`` of ``|activations|`` along batch+channel."""
+    """Per-token ``percentile`` of ``|activations|`` along the batch×channel axes."""
     if abs_activations.ndim != 3:
         raise ValueError(
-            f"token_position_percentile_amax expects (batch, num_tokens, in_features), "
+            f"token_percentile_amax expects (batch, num_tokens, in_features), "
             f"got {tuple(abs_activations.shape)}."
         )
-    if percentile >= 100.0:
-        return abs_activations.abs().amax(dim=(0, 2))
-    # torch.quantile only accepts a single dim; fold batch×channel into one axis.
+    # Fold batch×channel into one axis: (T, B*D).
     x = abs_activations.to(torch.float32).permute(1, 0, 2).reshape(
         abs_activations.shape[1], -1
     )
-    return torch.quantile(x, percentile / 100.0, dim=1)
+    return _topk_percentile_along(x, percentile, dim=1)
 
 
 def channel_percentile_amax(
@@ -87,10 +93,8 @@ def channel_percentile_amax(
             f"channel_percentile_amax expects (num_tokens, in_features), "
             f"got {tuple(abs_activations.shape)}."
         )
-    if percentile >= 100.0:
-        return abs_activations.abs().amax(dim=0)
-    return torch.quantile(
-        abs_activations.to(torch.float32), percentile / 100.0, dim=0
+    return _topk_percentile_along(
+        abs_activations.to(torch.float32), percentile, dim=0
     )
 
 
@@ -492,7 +496,6 @@ __all__ = [
     "no_quantize",
     "channel_percentile_amax",
     "token_percentile_amax",
-    "token_position_percentile_amax",
     "percentile_amax",
     "quantize_weight",
     "rtn_quantize",

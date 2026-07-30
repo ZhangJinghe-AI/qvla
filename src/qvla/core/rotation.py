@@ -650,7 +650,7 @@ class PipelineRotationBuild:
 
         if step == "perm":
             amax = (
-                stats.static_channel_amax.to(device)
+                stats.static_cross_channel_amax.to(device)
                 if stats is not None and stats.n_tokens > 0
                 else None
             )

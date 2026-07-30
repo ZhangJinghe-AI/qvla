@@ -31,7 +31,8 @@ class _ToyModel(nn.Module):
         self.linear_b = nn.Linear(d_hidden, d_out, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.linear_b(torch.relu(self.linear_a(x)))
+        # Fisher expects chunked actions (B, T, A); T=1 for this toy.
+        return self.linear_b(torch.relu(self.linear_a(x))).unsqueeze(1)
 
 
 class _ToyDiTModel(nn.Module):
@@ -46,7 +47,7 @@ class _ToyDiTModel(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         for _ in range(self.num_steps):
             x = x + self.step_linear(x)
-        return self.out_proj(x)
+        return self.out_proj(x).unsqueeze(1)
 
 
 def _make_targets(
@@ -70,7 +71,7 @@ def test_fisher_collector_captures_nonzero_sensitivity():
     model = _ToyModel(d_in=32, d_hidden=16, d_out=7)
     targets = _make_targets(model, scope="dit")
 
-    with FisherCollector(targets) as fc:
+    with FisherCollector(targets, action_dim=7) as fc:
         fc.begin_sample()
         x = torch.randn(2, 32, requires_grad=True)
         actions = model(x)
@@ -91,7 +92,7 @@ def test_fisher_collector_multiple_samples():
     model = _ToyModel()
     targets = _make_targets(model)
 
-    with FisherCollector(targets) as fc:
+    with FisherCollector(targets, action_dim=7) as fc:
         for _ in range(3):
             fc.begin_sample()
             x = torch.randn(2, 32, requires_grad=True)
@@ -100,9 +101,39 @@ def test_fisher_collector_multiple_samples():
         results = fc.get_results()
 
     for result in results.values():
-        assert result._n_samples == 3
+        # Each forward has batch_size=2; Fisher counts observations.
+        assert result._n_samples == 6
         per_step = result.sensitivity_per_step()
         assert per_step is not None
+
+
+def test_fisher_collector_batch_matches_per_sample_mean():
+    """One B=2 forward must match two B=1 forwards (equal token counts)."""
+    torch.manual_seed(0)
+    model = _ToyModel(d_in=8, d_hidden=4, d_out=3)
+    targets = _make_targets(model, scope="llm")
+    x = torch.randn(2, 8, requires_grad=True)
+
+    with FisherCollector(targets, action_dim=3) as fc:
+        fc.begin_sample()
+        actions = model(x)
+        fc.compute_jacobian_sensitivity(actions, model=model, action_timestep="0")
+        batched = {
+            n: r.aggregate("uniform").clone() for n, r in fc.get_results().items()
+        }
+
+    with FisherCollector(targets, action_dim=3) as fc:
+        for b in range(2):
+            fc.begin_sample()
+            xb = x[b : b + 1].detach().requires_grad_(True)
+            actions = model(xb)
+            fc.compute_jacobian_sensitivity(actions, model=model, action_timestep="0")
+        per_sample = {
+            n: r.aggregate("uniform").clone() for n, r in fc.get_results().items()
+        }
+
+    for name in batched:
+        assert torch.allclose(batched[name], per_sample[name], rtol=1e-4, atol=1e-5), name
 
 
 def test_fisher_collector_dit_per_step():
@@ -110,7 +141,7 @@ def test_fisher_collector_dit_per_step():
     model = _ToyDiTModel(d=16, d_out=7, num_steps=3)
     targets = _make_targets(model, scope="dit")
 
-    with FisherCollector(targets, num_dit_steps=3) as fc:
+    with FisherCollector(targets, num_dit_steps=3, action_dim=7) as fc:
         fc.begin_sample()
         x = torch.randn(1, 16, requires_grad=True)
 
@@ -119,7 +150,7 @@ def test_fisher_collector_dit_per_step():
             x = x + model.step_linear(x)
 
         fc.set_current_step(None)
-        actions = model.out_proj(x)
+        actions = model.out_proj(x).unsqueeze(1)
         fc.compute_jacobian_sensitivity(actions, model=model)
         results = fc.get_results()
 
@@ -131,12 +162,49 @@ def test_fisher_collector_dit_per_step():
         assert step_idx in per_step
 
 
+def test_fisher_hutchinson_matches_exact_on_toy():
+    """Hutchinson estimate should approach exact Fisher on a toy model."""
+    torch.manual_seed(0)
+    model = _ToyModel(d_in=12, d_hidden=6, d_out=5)
+    targets = _make_targets(model, scope="llm")
+    x_data = torch.randn(4, 12)
+
+    with FisherCollector(targets, action_dim=5) as fc_exact:
+        fc_exact.begin_sample()
+        x = x_data.clone().requires_grad_(True)
+        actions = model(x)
+        fc_exact.compute_jacobian_sensitivity(
+            actions, model=model, action_timestep="0", method="exact"
+        )
+        exact = {
+            n: r.aggregate("uniform").clone() for n, r in fc_exact.get_results().items()
+        }
+
+    with FisherCollector(targets, action_dim=5) as fc_h:
+        fc_h.begin_sample()
+        x = x_data.clone().requires_grad_(True)
+        actions = model(x)
+        fc_h.compute_jacobian_sensitivity(
+            actions,
+            model=model,
+            action_timestep="0",
+            method="hutchinson",
+            hutchinson_probes=256,
+        )
+        approx = {
+            n: r.aggregate("uniform").clone() for n, r in fc_h.get_results().items()
+        }
+
+    for name in exact:
+        assert torch.allclose(approx[name], exact[name], rtol=0.25, atol=1e-4), name
+
+
 def test_fisher_collector_llm_no_step():
     """LLM-scope layers should have step=None regardless of set_current_step."""
     model = _ToyModel()
     targets = _make_targets(model, scope="llm")
 
-    with FisherCollector(targets) as fc:
+    with FisherCollector(targets, action_dim=7) as fc:
         fc.begin_sample()
         fc.set_current_step(5)
         x = torch.randn(2, 32, requires_grad=True)
@@ -149,22 +217,20 @@ def test_fisher_collector_llm_no_step():
         assert set(per_step.keys()) == {None}
 
 
-def test_fisher_collector_no_grad_skips():
-    """When actions has no grad_fn, the collector should skip gracefully."""
+def test_fisher_collector_no_grad_raises():
+    """When actions has no grad_fn, Fisher must fail loudly."""
+    import pytest
+
     model = _ToyModel()
     targets = _make_targets(model)
 
-    with FisherCollector(targets) as fc:
+    with FisherCollector(targets, action_dim=7) as fc:
         fc.begin_sample()
         with torch.no_grad():
             x = torch.randn(2, 32)
             actions = model(x)
-        fc.compute_jacobian_sensitivity(actions, model=model)
-        results = fc.get_results()
-
-    for result in results.values():
-        sens = result.aggregate("uniform")
-        assert sens.abs().sum().item() == 0
+        with pytest.raises(RuntimeError, match="no grad_fn"):
+            fc.compute_jacobian_sensitivity(actions, model=model)
 
 
 def test_fisher_3d_actions():
@@ -181,7 +247,7 @@ def test_fisher_3d_actions():
     model = _ChunkedModel()
     targets = _make_targets(model)
 
-    with FisherCollector(targets) as fc:
+    with FisherCollector(targets, action_dim=7) as fc:
         fc.begin_sample()
         x = torch.randn(2, 16, requires_grad=True)
         actions = model(x)
@@ -193,6 +259,74 @@ def test_fisher_3d_actions():
     sens = result.aggregate("uniform")
     assert sens.shape == (16,)
     assert sens.abs().sum().item() > 0
+
+
+def test_fisher_action_timestep_list():
+    from qvla.build.fisher import select_fisher_actions
+
+    actions = torch.randn(2, 50, 32, requires_grad=True)
+    selected = select_fisher_actions(actions, timestep="0,29,49", action_dim=7)
+    assert selected.shape == (2, 3, 7)
+    assert torch.equal(selected[:, 0, :], actions[:, 0, :7])
+    assert torch.equal(selected[:, 1, :], actions[:, 29, :7])
+    assert torch.equal(selected[:, 2, :], actions[:, 49, :7])
+
+
+def test_fisher_action_timestep_last_reduces_dims():
+    from qvla.build.fisher import select_fisher_actions
+
+    actions = torch.randn(2, 50, 32, requires_grad=True)
+    selected = select_fisher_actions(actions, timestep="49", action_dim=7)
+    assert selected.shape == (2, 7)
+    assert torch.equal(selected, actions[:, -1, :7])
+
+    selected0 = select_fisher_actions(actions, timestep="0", action_dim=7)
+    assert torch.equal(selected0, actions[:, 0, :7])
+
+
+def test_layer_fisher_result_aggregate_max():
+    result = LayerFisherResult(name="test", scope="dit", in_features=4)
+    result._step_accum = {
+        0: torch.tensor([1.0, 4.0, 2.0, 3.0]),
+        1: torch.tensor([3.0, 1.0, 5.0, 2.0]),
+    }
+    result._n_samples = 1
+    agg = result.aggregate("max")
+    assert agg.tolist() == [3.0, 4.0, 5.0, 3.0]
+
+
+def test_normalize_fisher_sensitivity():
+    from qvla.build.fisher import normalize_fisher_sensitivity
+
+    f = torch.tensor([1.0, 2.0, 3.0, 4.0])
+    n = normalize_fisher_sensitivity(f)
+    assert n.mean().item() == pytest.approx(1.0)
+    assert torch.allclose(n, f / f.mean())
+
+
+def test_normalize_fisher_all_zero_returns_zero():
+    from qvla.build.fisher import normalize_fisher_sensitivity
+
+    z = torch.zeros(8)
+    n = normalize_fisher_sensitivity(z)
+    assert torch.all(n > 0)
+    assert torch.allclose(n, torch.full_like(z, 1e-8))
+
+
+def test_fisher_action_dim_exceeds_native_raises():
+    from qvla.build.fisher import select_fisher_actions
+
+    actions = torch.randn(1, 50, 32)
+    with pytest.raises(ValueError, match="exceeds native"):
+        select_fisher_actions(actions, timestep="49", action_dim=33)
+
+
+def test_fisher_action_timestep_bad_text_raises():
+    from qvla.build.fisher import select_fisher_actions
+
+    actions = torch.randn(1, 50, 32)
+    with pytest.raises(ValueError, match="integer indices"):
+        select_fisher_actions(actions, timestep="sampled", action_dim=7)
 
 
 # -------------------------------------------------------------------- #
@@ -341,15 +475,40 @@ def test_config_needs_fisher():
     assert cfg_policy.needs_fisher
 
 
+def test_config_fisher_batch_size_exceeds_samples_raises():
+    from qvla.build.builder import _validate_fisher_batch_config
+    from qvla.config import QVLAConfig
+
+    cfg = QVLAConfig.pi05_default().with_overrides(
+        fisher_num_samples=2,
+        fisher_batch_size=4,
+    )
+    with pytest.raises(ValueError, match="cannot exceed"):
+        _validate_fisher_batch_config(cfg)
+
+
 def test_config_fisher_fields_serialize():
     from qvla.config import QVLAConfig
 
     cfg = QVLAConfig.pi05_default()
-    cfg = cfg.with_overrides(fisher_num_samples=8, fisher_step_aggregation="uniform")
+    cfg = cfg.with_overrides(
+        fisher_num_samples=8,
+        fisher_step_aggregation="max",
+        noise_ensemble_k=4,
+        fisher_action_timestep="0,29,49",
+        fisher_method="hutchinson",
+        fisher_hutchinson_probes=16,
+        fisher_batch_size=2,
+    )
     d = cfg.to_dict()
     cfg2 = QVLAConfig.from_dict(d)
     assert cfg2.fisher_num_samples == 8
-    assert cfg2.fisher_step_aggregation == "uniform"
+    assert cfg2.fisher_step_aggregation == "max"
+    assert cfg2.noise_ensemble_k == 4
+    assert cfg2.fisher_action_timestep == "0,29,49"
+    assert cfg2.fisher_method == "hutchinson"
+    assert cfg2.fisher_hutchinson_probes == 16
+    assert cfg2.fisher_batch_size == 2
 
 
 def test_expert_linear_grad_patch_restores_autograd():

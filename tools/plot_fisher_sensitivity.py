@@ -40,7 +40,7 @@ _ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT / "src"))
 
 from qvla.adapters import get_adapter  # noqa: E402
-from qvla.build.fisher import FisherCollector  # noqa: E402
+from qvla.build.fisher import FisherCollector, resolve_fisher_action_dim  # noqa: E402
 from qvla.config import QVLAConfig  # noqa: E402
 from qvla.runtime import list_target_modules  # noqa: E402
 
@@ -159,6 +159,8 @@ def _collect_fisher_and_activation(
     num_samples: int,
     num_dit_steps: int,
     act_metric: ActMetric,
+    fisher_method: str = "exact",
+    hutchinson_probes: int = 8,
 ) -> tuple[dict[str, dict[int | None, torch.Tensor]], dict[str, dict[int | None, torch.Tensor]]]:
     """Run Fisher pass; also accumulate per-channel activation energy on the same forwards."""
     from qvla.adapters.pi05.step_hook import patched_one_step
@@ -205,7 +207,9 @@ def _collect_fisher_and_activation(
 
     try:
         with differentiable_inference_context(sched):
-            with FisherCollector(targets, num_dit_steps) as fc:
+            with FisherCollector(
+                targets, num_dit_steps, action_dim=resolve_fisher_action_dim(adapter)
+            ) as fc:
                 for i, batch in enumerate(adapter.iter_calibration_batches(num_samples)):
                     print(f"Fisher sample {i + 1}/{num_samples}")
                     fc.begin_sample()
@@ -224,8 +228,13 @@ def _collect_fisher_and_activation(
 
                     with patched_one_step(runner, _step_cb):
                         fc.set_current_step(None)
-                        actions = adapter.forward_differentiable(batch)
-                    fc.compute_jacobian_sensitivity(actions, model=model)
+                        actions = adapter.forward_differentiable([batch])
+                    fc.compute_jacobian_sensitivity(
+                        actions,
+                        model=model,
+                        method=fisher_method,
+                        hutchinson_probes=hutchinson_probes,
+                    )
 
                 fisher_results = fc.get_results()
     finally:
@@ -345,6 +354,21 @@ def main(argv: list[str] | None = None) -> int:
     )
     p.add_argument("--fisher-num-samples", type=int, default=1)
     p.add_argument(
+        "--fisher-method",
+        choices=("exact", "hutchinson"),
+        default="exact",
+        help=(
+            "Fisher estimator: exact (one backward per action dim) or "
+            "hutchinson (random-projection approximation)."
+        ),
+    )
+    p.add_argument(
+        "--fisher-hutchinson-probes",
+        type=int,
+        default=8,
+        help="Number of random projections when --fisher-method=hutchinson.",
+    )
+    p.add_argument(
         "--fisher-step-aggregation",
         choices=("uniform",),
         default="uniform",
@@ -374,6 +398,8 @@ def main(argv: list[str] | None = None) -> int:
         p.error("--calibration-data is required when --calibration-source=file.")
     if args.fisher_num_samples < 1:
         p.error("--fisher-num-samples must be >= 1.")
+    if args.fisher_hutchinson_probes < 1:
+        p.error("--fisher-hutchinson-probes must be >= 1.")
     if args.all_layers:
         if args.output_dir is None:
             p.error("--output-dir is required with --all-layers.")
@@ -402,13 +428,24 @@ def main(argv: list[str] | None = None) -> int:
     )
     num_dit_steps = adapter.dit_step_count(config)
 
-    print(f"Collecting Fisher + energy for {len(targets)} layer(s)...")
+    print(
+        f"Collecting Fisher + energy for {len(targets)} layer(s) "
+        f"(method={args.fisher_method}"
+        + (
+            f", probes={args.fisher_hutchinson_probes}"
+            if args.fisher_method == "hutchinson"
+            else ""
+        )
+        + ")..."
+    )
     fisher_map, act_map = _collect_fisher_and_activation(
         adapter,
         targets,
         num_samples=args.fisher_num_samples,
         num_dit_steps=num_dit_steps,
         act_metric=args.act_metric,
+        fisher_method=args.fisher_method,
+        hutchinson_probes=args.fisher_hutchinson_probes,
     )
 
     try:

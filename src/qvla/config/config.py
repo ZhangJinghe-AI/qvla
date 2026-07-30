@@ -32,7 +32,10 @@ WeightQuantizer = Literal["gptq", "rtn", "rtn_residual"]
 ActScaleMode = Literal["per_step", "static", "dynamic"]
 ActScaleGranularity = Literal["per_channel", "per_token"]
 ActPercentileMode = Literal["inner", "cross"]
-StepAggregation = Literal["uniform"]
+StepAggregation = Literal[
+    "uniform", "max", "late_mean", "very_late_mean", "weighted_linear"
+]
+FisherMethod = Literal["exact", "hutchinson"]
 PermScore = Literal["weight", "activation", "activation_weight", "fisher"]
 SvdSource = Literal["weight", "activation"]
 PipelineStep = Literal["perm", "svd", "hadamard", "random_hadamard"]
@@ -103,6 +106,10 @@ class ScopeConfig:
     gptq_damp_percent: float = 0.01
     gptq_block_size: int = 128
 
+    # When True, weight the GPTQ Hessian by per-channel Fisher sensitivity
+    # so that GPTQ protects action-sensitive input columns more aggressively.
+    fisher_gptq: bool = False
+
 
 @dataclass(frozen=True)
 class QVLAConfig:
@@ -126,9 +133,31 @@ class QVLAConfig:
 
     fisher_num_samples: int = 4
     fisher_step_aggregation: StepAggregation = "uniform"
+    # How to aggregate per-step DiT XᵀX (covariance / Hessian) into a single
+    # matrix per layer.  Applies to rotation fitting (SVD/perm) and GPTQ Hessian.
+    # "uniform"         all steps equal weight (default, matches legacy behaviour).
+    # "late_mean"       only the second half of denoise steps.
+    # "very_late_mean"  only the last fifth of denoise steps (e.g. 8-9 for 10 steps).
+    # "weighted_linear" w(s) ∝ (s+1), later steps contribute more.
+    calibration_step_aggregation: StepAggregation = "uniform"
+    # Action-chunk timesteps for Fisher Jacobian:
+    # "all" | integer index | comma-separated indices (e.g. "0,29,50").
+    fisher_action_timestep: str = "0,24,49"
+    # Fisher estimator: exact Jacobian loop or Hutchinson random projections.
+    fisher_method: FisherMethod = "exact"
+    # Number of random projections when fisher_method="hutchinson".
+    fisher_hutchinson_probes: int = 8
+    # Observations per differentiable Fisher forward. Pack build raises the
+    # pi0.5 engine max_batch_size to at least this before build_model().
+    fisher_batch_size: int = 4
 
     # Per-layer random Hadamard seeds are derived from this + qualified layer name.
     build_seed: int = 0
+
+    # Independent diffusion noises per calibration sample (pi0.5), applied when
+    # calibrating DiT layers (LLM-only passes stay at K=1). Collector aggregates
+    # across them (max amax, sum XᵀX). ``1`` = previous behaviour.
+    noise_ensemble_k: int = 1
 
     # ---- serialization ---------------------------------------------------
 
@@ -145,10 +174,16 @@ class QVLAConfig:
             model_kind=d.get("model_kind", "pi05"),
             llm=llm,
             dit=dit,
-            skip_incompatible=d.get("skip_incompatible", True),
+            skip_incompatible=d.get("skip_incompatible", False),
             fisher_num_samples=d.get("fisher_num_samples", 4),
             fisher_step_aggregation=d.get("fisher_step_aggregation", "uniform"),
+            calibration_step_aggregation=d.get("calibration_step_aggregation", "uniform"),
+            fisher_action_timestep=d.get("fisher_action_timestep", "0,24,49"),
+            fisher_method=d.get("fisher_method", "exact"),
+            fisher_hutchinson_probes=d.get("fisher_hutchinson_probes", 8),
+            fisher_batch_size=d.get("fisher_batch_size", 4),
             build_seed=d.get("build_seed", 0),
+            noise_ensemble_k=d.get("noise_ensemble_k", 1),
         )
 
     def to_json(self, path: str | Path) -> None:
@@ -268,11 +303,15 @@ class QVLAConfig:
 
     @property
     def needs_fisher(self) -> bool:
-        """True when any scope uses Fisher-driven zigzag perm."""
+        """True when any scope needs original-space Fisher for rotation fitting.
+
+        Covers ``perm_score=fisher`` (and any Fisher-weighted SVD that reuses
+        that same early pass). Fisher-GPTQ is separate: it runs a second pass
+        after rotations are fitted, gated by ``ScopeConfig.fisher_gptq``.
+        """
         return (
-            "perm" in self.llm.pipeline and self.llm.perm_score == "fisher"
-        ) or (
-            "perm" in self.dit.pipeline and self.dit.perm_score == "fisher"
+            ("perm" in self.llm.pipeline and self.llm.perm_score == "fisher")
+            or ("perm" in self.dit.pipeline and self.dit.perm_score == "fisher")
         )
 
 

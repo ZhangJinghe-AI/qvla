@@ -27,8 +27,14 @@ import torch.nn as nn
 
 from qvla.adapters import ModelAdapter
 from qvla.build.collector import (
+    AmaxCollectPlan,
     LayerStats,
     RotatedActivationCollector,
+)
+from qvla.build.utils import (
+    choose_collector_device,
+    install_crash_handler,
+    log_memory,
 )
 from qvla.config import QVLAConfig, ScopeConfig
 from qvla.core.pack import LayerPack, Pack
@@ -55,31 +61,49 @@ def _scope_cfg(config: QVLAConfig, scope: str) -> ScopeConfig:
     return config.llm if scope == "llm" else config.dit
 
 
+def _fisher_targets_for_gptq(
+    target_modules: list[tuple[str, str, nn.Module]],
+    config: QVLAConfig,
+) -> list[tuple[str, str, nn.Module]]:
+    """Layers whose scope enables ``fisher_gptq``."""
+    out: list[tuple[str, str, nn.Module]] = []
+    for name, scope, mod in target_modules:
+        if _scope_cfg(config, scope).fisher_gptq:
+            out.append((name, scope, mod))
+    return out
+
+
 def _needs_offline_act_scale(scope_cfg: ScopeConfig) -> bool:
     """True when the runtime uses a baked ``act_scale_table`` (not dynamic)."""
     return scope_cfg.act_scale_mode in ("static", "per_step")
 
 
+def _amax_collect_plan(scope_cfg: ScopeConfig) -> AmaxCollectPlan:
+    """Select which amax streams phase-2 must keep for this scope."""
+    if not _needs_offline_act_scale(scope_cfg):
+        return AmaxCollectPlan()
+    p = float(scope_cfg.act_percentile)
+    if scope_cfg.act_percentile_mode == "inner":
+        if scope_cfg.act_scale_granularity == "per_token":
+            return AmaxCollectPlan(collect_inner_token=True, inner_percentile=p)
+        return AmaxCollectPlan(collect_inner_channel=True, inner_percentile=p)
+    if scope_cfg.act_scale_granularity == "per_token":
+        return AmaxCollectPlan(collect_cross_token=True)
+    return AmaxCollectPlan(collect_cross_channel=True)
+
+
 def _act_scale_amax(
     stats: LayerStats, scope_cfg: ScopeConfig, *, step: int | None = None
 ) -> torch.Tensor:
+    """Resolve offline act amax; ``step`` is forwarded into LayerStats accessors."""
     p = scope_cfg.act_percentile
-    if step is None:
-        if scope_cfg.act_scale_granularity == "per_token":
-            if scope_cfg.act_percentile_mode == "cross":
-                return percentile_amax(stats.static_token_amax, p)
-            return stats.act_token_percentile_amax(p, step=step)
-        if scope_cfg.act_percentile_mode == "cross":
-            return percentile_amax(stats.static_channel_amax, p)
-        return stats.act_channel_percentile_amax(p, step=step)
-
     if scope_cfg.act_scale_granularity == "per_token":
         if scope_cfg.act_percentile_mode == "cross":
-            return percentile_amax(stats.per_step_token_amax[step], p)
-        return stats.act_token_percentile_amax(p, step=step)
+            return percentile_amax(stats.act_token_cross_amax(step=step), p)
+        return stats.act_token_inner_amax(step=step)
     if scope_cfg.act_percentile_mode == "cross":
-        return percentile_amax(stats.per_step_channel_amax[step], p)
-    return stats.act_channel_percentile_amax(p, step=step)
+        return percentile_amax(stats.act_channel_cross_amax(step=step), p)
+    return stats.act_channel_inner_amax(step=step)
 
 
 def _build_act_scale_table(
@@ -94,16 +118,21 @@ def _build_act_scale_table(
     if scope_cfg.act_scale_mode == "static":
         amax = _act_scale_amax(stats, scope_cfg)
         return (amax.clamp_min(1e-12) / act_qmax).to(torch.float32)
-    if stats.per_step_channel_amax is None:
-        logger.warning(
-            "Requested per_step scales but collector has no per-step amax; "
-            "downgrading to static."
+    # per_step: step count lives on whichever stream the plan collected.
+    if scope_cfg.act_scale_granularity == "per_token":
+        step_buf = (
+            stats.per_step_cross_token_amax
+            if scope_cfg.act_percentile_mode == "cross"
+            else stats.per_step_inner_token_amax
         )
-        amax = _act_scale_amax(stats, scope_cfg)
-        return (amax.clamp_min(1e-12) / act_qmax).unsqueeze(0).to(torch.float32)
+    else:
+        step_buf = (
+            stats.per_step_cross_channel_amax
+            if scope_cfg.act_percentile_mode == "cross"
+            else stats.per_step_inner_channel_amax
+        )
     rows = [
-        _act_scale_amax(stats, scope_cfg, step=s)
-        for s in range(stats.per_step_channel_amax.shape[0])
+        _act_scale_amax(stats, scope_cfg, step=s) for s in range(step_buf.shape[0])
     ]
     table = torch.stack(rows, dim=0).clamp_min(1e-12) / act_qmax
     return table.to(torch.float32)
@@ -114,6 +143,48 @@ def _rotate_weight(w: torch.Tensor, rotation: Rotation) -> torch.Tensor:
     if rotation.is_identity:
         return w.contiguous()
     return rotation.apply(w.to(torch.float32)).contiguous()
+
+
+def _effective_noise_ensemble_k(
+    targets: list[tuple[str, str, nn.Module]],
+    config: QVLAConfig,
+) -> int:
+    """K>1 only when DiT layers are being calibrated.
+
+    Diffusion noise mainly affects the DiT action head; LLM prefix activations
+    are essentially noise-invariant, so ensemble loops there waste compute.
+    """
+    k = config.noise_ensemble_k
+    if k < 1:
+        raise ValueError(f"noise_ensemble_k must be >= 1, got {k}.")
+    if any(scope == "dit" for _, scope, _ in targets):
+        return k
+    return 1
+
+
+def _compute_dit_step_weights(
+    method: str, num_steps: int
+) -> dict[int, float] | None:
+    """Per-step XᵀX weights for DiT calibration aggregation.
+
+    Returns ``None`` for uniform (current behaviour, all weights = 1.0).
+    """
+    if method == "uniform" or num_steps <= 1:
+        return None
+    if method == "late_mean":
+        start = num_steps // 2
+        return {s: (1.0 if s >= start else 0.0) for s in range(num_steps)}
+    if method == "very_late_mean":
+        start = num_steps - max(1, num_steps // 5)
+        return {s: (1.0 if s >= start else 0.0) for s in range(num_steps)}
+    if method == "weighted_linear":
+        return {s: float(s + 1) for s in range(num_steps)}
+    if method == "max":
+        raise ValueError(
+            "calibration_step_aggregation='max' is not supported for XᵀX; "
+            "use 'uniform', 'late_mean', 'very_late_mean', or 'weighted_linear'."
+        )
+    raise ValueError(f"Unknown calibration_step_aggregation: {method!r}")
 
 
 def _run_transformed_calibration(
@@ -130,27 +201,70 @@ def _run_transformed_calibration(
     progress_base: float,
     progress_span: float,
 ) -> dict[str, LayerStats]:
-    """Forward ``num_samples`` batches; collect stats on ``transform.apply(x)``."""
+    """Forward ``num_samples × K``; collect on ``transform.apply(x)``.
+
+    ``K = noise_ensemble_k`` when ``targets`` include DiT layers, else ``K = 1``.
+    LLM layer hooks are skipped for ``noise_index > 0`` because LLM activations
+    are diffusion-noise-invariant; collecting once is enough.
+    """
+    k = _effective_noise_ensemble_k(targets, config)
     num_steps = {"llm": 1, "dit": config.dit.num_steps}
+    dit_step_weights = _compute_dit_step_weights(
+        config.calibration_step_aggregation, config.dit.num_steps
+    )
+    total = num_samples * k
+    amax_plans = (
+        {
+            "llm": _amax_collect_plan(config.llm),
+            "dit": _amax_collect_plan(config.dit),
+        }
+        if quant_stats
+        else None
+    )
+    model_device = getattr(targets[0][2], "weight").device
+    collector_device = choose_collector_device(targets, model_device)
     with RotatedActivationCollector(
         targets,
         transforms,
         num_steps_by_scope=num_steps,
-        device="cpu",
+        device=collector_device,
         quant_stats=quant_stats,
+        amax_plan_by_scope=amax_plans,
+        noise_ensemble_k=k,
+        dit_step_weights=dit_step_weights,
     ) as collector:
         def step_cb(step: int) -> None:
             collector.set_current_step(step)
 
+        log_memory(f"{log_label}: before calibration loop")
         with torch.inference_mode():
+            done = 0
             for i, batch in enumerate(adapter.iter_calibration_batches(num_samples)):
-                logger.info("%s sample %d/%d ...", log_label, i + 1, num_samples)
-                adapter.forward_for_calibration(
-                    model, batch, step_callback=step_cb, sample_index=i
-                )
-                if progress:
-                    frac = progress_base + progress_span * (i + 1) / max(1, num_samples)
-                    progress("calibrate", frac)
+                for noise_index in range(k):
+                    collector.set_noise_index(noise_index)
+                    logger.info(
+                        "%s sample %d/%d noise %d/%d ...",
+                        log_label,
+                        i + 1,
+                        num_samples,
+                        noise_index + 1,
+                        k,
+                    )
+                    adapter.forward_for_calibration(
+                        model,
+                        batch,
+                        step_callback=step_cb,
+                        sample_index=i,
+                        noise_index=noise_index,
+                    )
+                    done += 1
+                    if progress:
+                        frac = progress_base + progress_span * done / max(1, total)
+                        progress("calibrate", frac)
+                gc.collect()
+                torch.cuda.empty_cache()
+                if (i + 1) % 3 == 0 or i == num_samples - 1:
+                    log_memory(f"{log_label}: after sample {i + 1}/{num_samples}")
     return {name: collector.stats[name] for name, _s, _m in targets}
 
 
@@ -229,12 +343,17 @@ def _build_rotations_pipeline_wise(
                 step_idx += 1
                 for name, _, _ in scope_targets:
                     builders[name].fit_step(step_index, stats=stats[name])
-                # Each activation-calibration pass allocates one float64 X.T@X per
-                # target layer on CPU (~40 GiB for pi0.5 LLM). Free before the
-                # next pass so the RHS of ``stats = _run_transformed_calibration``
-                # does not briefly double peak RSS (perm then svd both need stats).
+                # Each activation-calibration pass allocates one float32 X.T@X per
+                # target layer (~20 GiB for pi0.5 LLM, on GPU when it fits).
+                # Free before the next pass so ``stats = _run_transformed_calibration``
+                # does not briefly double peak memory (perm then svd both need stats).
+                # Also empty the CUDA caching allocator: otherwise ``mem_get_info``
+                # still shows the previous xtx as occupied and the next step falls
+                # back to CPU even though Python has released the tensors.
                 del stats
                 gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
             else:
                 for name, _, _ in scope_targets:
                     builders[name].fit_step(step_index, stats=None)
@@ -252,7 +371,8 @@ def _make_layer_pack(
     quant_stats: LayerStats,
     scope_cfg: ScopeConfig,
     rotation: Rotation,
-) -> LayerPack | None:
+    fisher_sensitivity: torch.Tensor | None = None,
+) -> LayerPack:
     """Quantize one layer using stats on ``rotation.apply(x)``."""
     w = getattr(module, "weight").detach()
     bias_attr = getattr(module, "bias", None)
@@ -267,19 +387,42 @@ def _make_layer_pack(
     W_rot = _rotate_weight(w.to(torch.float32), rotation)
     H_rot = quant_stats.hessian().to(device)
 
-    try:
-        qw: QuantizedWeight = quantize_weight(
-            W_rot,
-            scope_cfg.weight_quantizer,
-            group_size=scope_cfg.group_size,
-            weight_bits=scope_cfg.weight_bits,
-            hessian=H_rot,
-            gptq_block_size=scope_cfg.gptq_block_size,
-            gptq_damp_percent=scope_cfg.gptq_damp_percent,
+    if scope_cfg.fisher_gptq:
+        if scope_cfg.weight_quantizer != "gptq":
+            raise ValueError(
+                f"fisher_gptq=True requires weight_quantizer='gptq', "
+                f"got {scope_cfg.weight_quantizer!r} for layer {name!r}."
+            )
+        if fisher_sensitivity is None:
+            raise ValueError(
+                f"fisher_gptq=True but no Fisher sensitivity available "
+                f"for layer {name!r}."
+            )
+        from qvla.build.fisher import normalize_fisher_sensitivity
+
+        F_norm = normalize_fisher_sensitivity(fisher_sensitivity.to(device))
+        d_sqrt = F_norm.sqrt()
+        H_rot = H_rot * d_sqrt.unsqueeze(1) * d_sqrt.unsqueeze(0)
+        logger.info(
+            "Fisher-GPTQ %s: F_norm max/min ratio = %.1f "
+            "(max=%.2e min=%.2e; mean=1.0; %d rotation blocks of %d).",
+            name,
+            F_norm.max().item() / max(F_norm.min().item(), 1e-12),
+            F_norm.max().item(),
+            F_norm.min().item(),
+            K // rotation.block_size,
+            rotation.block_size,
         )
-    except ValueError as e:
-        logger.warning("Skipping %s (quantizer error): %s", name, e)
-        return None
+
+    qw: QuantizedWeight = quantize_weight(
+        W_rot,
+        scope_cfg.weight_quantizer,
+        group_size=scope_cfg.group_size,
+        weight_bits=scope_cfg.weight_bits,
+        hessian=H_rot,
+        gptq_block_size=scope_cfg.gptq_block_size,
+        gptq_damp_percent=scope_cfg.gptq_damp_percent,
+    )
 
     act_scale_table: torch.Tensor | None = None
     if _needs_offline_act_scale(scope_cfg):
@@ -310,6 +453,57 @@ def _make_layer_pack(
     )
 
 
+def _validate_fisher_batch_config(config: QVLAConfig) -> None:
+    if config.fisher_num_samples < 1:
+        raise ValueError(
+            f"fisher_num_samples must be >= 1 when Fisher is enabled, "
+            f"got {config.fisher_num_samples}."
+        )
+    if config.fisher_batch_size < 1:
+        raise ValueError(
+            f"fisher_batch_size must be >= 1, got {config.fisher_batch_size}."
+        )
+    if config.fisher_batch_size > config.fisher_num_samples:
+        raise ValueError(
+            f"fisher_batch_size={config.fisher_batch_size} cannot exceed "
+            f"fisher_num_samples={config.fisher_num_samples}."
+        )
+
+
+def _configure_adapter_for_fisher(adapter: ModelAdapter, config: QVLAConfig) -> None:
+    """Raise engine batch capacity before ``build_model`` when Fisher runs."""
+    needs = (
+        config.needs_fisher or config.llm.fisher_gptq or config.dit.fisher_gptq
+    )
+    if not needs:
+        return
+    _validate_fisher_batch_config(config)
+    required = int(config.fisher_batch_size)
+    cfg = getattr(adapter, "cfg", None)
+    if cfg is None or not hasattr(cfg, "max_batch_size"):
+        raise RuntimeError(
+            f"fisher_batch_size={config.fisher_batch_size} requires an adapter "
+            "with cfg.max_batch_size (pi05); got "
+            f"{type(adapter).__name__}."
+        )
+    if adapter.engine is not None:
+        engine_bs = int(adapter.engine.entry.scheduler.max_batch_size)
+        raise RuntimeError(
+            "Adapter engine is already built; this build path expects an "
+            "uninitialized adapter so fisher batch sizing can be configured "
+            "before build_model(). "
+            f"current max_batch_size={engine_bs}, required={required}."
+        )
+    prev = int(getattr(cfg, "max_batch_size", 1))
+    cfg.max_batch_size = max(prev, required)
+    if cfg.max_batch_size != prev:
+        logger.info(
+            "Raised adapter max_batch_size %d → %d for Fisher batching.",
+            prev,
+            cfg.max_batch_size,
+        )
+
+
 def build_pack(
     adapter: ModelAdapter,
     *,
@@ -319,10 +513,14 @@ def build_pack(
     progress: Callable[[str, float], None] | None = None,
 ) -> Pack:
     """Run the full offline calibration + quantization pipeline."""
+    install_crash_handler()
     t0 = time.time()
+
+    _configure_adapter_for_fisher(adapter, config)
 
     if progress:
         progress("build_model", 0.0)
+    log_memory("build_pack: start")
     model, config = adapter.prepare_model(config)
 
     target_modules = list_target_modules(model, config)
@@ -343,21 +541,46 @@ def build_pack(
 
     from qvla.build.calibration_noise import install_per_sample_calibration_noise
 
-    install_per_sample_calibration_noise(adapter, build_seed=config.build_seed)
+    install_per_sample_calibration_noise(
+        adapter,
+        build_seed=config.build_seed,
+        noise_ensemble_k=config.noise_ensemble_k,
+    )
+    if config.noise_ensemble_k > 1:
+        logger.info(
+            "Noise-ensemble calibration: %d noises per sample (DiT targets only; "
+            "LLM-only passes use K=1).",
+            config.noise_ensemble_k,
+        )
 
+    fisher_action_dim: int | None = None
+    if config.needs_fisher or config.llm.fisher_gptq or config.dit.fisher_gptq:
+        from qvla.build.fisher import (
+            compute_fisher_sensitivity,
+            resolve_fisher_action_dim,
+        )
+
+        fisher_action_dim = resolve_fisher_action_dim(adapter)
+
+    # Fisher in original space — used for perm (perm_score=fisher) and
+    # Fisher-weighted SVD when sensitivity is available.
     fisher_sensitivities: dict[str, torch.Tensor] = {}
     if config.needs_fisher:
         if progress:
             progress("fisher", 0.05)
-        logger.info("Fisher perm requested — running Fisher pass ...")
-        from qvla.build.fisher import compute_fisher_sensitivity
-
+        logger.info("Fisher pass (original space) ...")
         fisher_sensitivities = compute_fisher_sensitivity(
             adapter,
             target_modules,
+            action_dim=fisher_action_dim,
             num_samples=config.fisher_num_samples,
             num_dit_steps=config.dit.num_steps,
             step_aggregation=config.fisher_step_aggregation,
+            noise_ensemble_k=config.noise_ensemble_k,
+            action_timestep=config.fisher_action_timestep,
+            batch_size=config.fisher_batch_size,
+            method=config.fisher_method,
+            hutchinson_probes=config.fisher_hutchinson_probes,
             progress=progress,
         )
         logger.info(
@@ -377,8 +600,48 @@ def build_pack(
         progress,
     )
 
+    # Fisher in rotated space — used for Fisher-GPTQ.
+    # Computed AFTER rotations are fitted so that rotation.apply(grad)
+    # preserves cross-channel correlations through Hadamard (unlike the
+    # diagonal approximation which uniformises within rotation blocks).
+    fisher_gptq_sensitivities: dict[str, torch.Tensor] = {}
+    if config.llm.fisher_gptq or config.dit.fisher_gptq:
+        if progress:
+            progress("fisher_gptq", 0.50)
+        fisher_gptq_targets = _fisher_targets_for_gptq(target_modules, config)
+        gptq_rots = {
+            name: rotations[name]
+            for name, _, _ in fisher_gptq_targets
+            if name in rotations
+        }
+        logger.info(
+            "Fisher pass (rotated space for GPTQ) on %d / %d layers ...",
+            len(fisher_gptq_targets),
+            len(target_modules),
+        )
+        fisher_gptq_sensitivities = compute_fisher_sensitivity(
+            adapter,
+            fisher_gptq_targets,
+            action_dim=fisher_action_dim,
+            num_samples=config.fisher_num_samples,
+            num_dit_steps=config.dit.num_steps,
+            step_aggregation=config.fisher_step_aggregation,
+            noise_ensemble_k=config.noise_ensemble_k,
+            action_timestep=config.fisher_action_timestep,
+            batch_size=config.fisher_batch_size,
+            method=config.fisher_method,
+            hutchinson_probes=config.fisher_hutchinson_probes,
+            rotations=gptq_rots,
+            progress=progress,
+        )
+        logger.info(
+            "Fisher-GPTQ pass done — %d layers with non-zero sensitivity.",
+            sum(1 for v in fisher_gptq_sensitivities.values() if v.abs().sum() > 0),
+        )
+
     if progress:
         progress("calibrate", 0.55)
+    log_memory("build_pack: before final calibration")
     logger.info("Final calibration pass on full pipeline (Hessian + act scales) ...")
     quant_stats = _run_transformed_calibration(
         adapter,
@@ -405,6 +668,7 @@ def build_pack(
                 quant_stats[name],
                 scope_cfg,
                 rotations[name],
+                fisher_sensitivity=fisher_gptq_sensitivities.get(name),
             )
         except Exception as e:
             if not config.skip_incompatible:
@@ -413,8 +677,6 @@ def build_pack(
                     "Set skip_incompatible=True to skip incompatible layers."
                 ) from e
             logger.warning("Skipping %s due to error: %s", name, e)
-            continue
-        if lp is None:
             continue
         layer_packs[name] = lp
         if progress:
@@ -427,6 +689,7 @@ def build_pack(
         meta={
             "model_kind": adapter.model_kind,
             "num_samples": num_samples,
+            "noise_ensemble_k": config.noise_ensemble_k,
             "build_seconds": round(time.time() - t0, 2),
         },
     )

@@ -40,6 +40,7 @@ from qvla.adapters.pi05.obs import build_pi05_request  # noqa: E402
 class ActionDiffMetrics:
     max_abs: float
     mean_abs: float
+    abs_l2: float
     rel_l2: float
     cosine: float
 
@@ -50,10 +51,12 @@ class ActionDiffMetrics:
         if a.shape != b.shape:
             raise ValueError(f"shape mismatch: original {tuple(original.shape)} vs replaced {tuple(replaced.shape)}")
         diff = a - b
+        abs_l2 = float(diff.norm().item())
         denom = b.norm().clamp_min(1e-12)
         return cls(
             max_abs=float(diff.abs().max().item()),
             mean_abs=float(diff.abs().mean().item()),
+            abs_l2=abs_l2,
             rel_l2=float(diff.norm() / denom),
             cosine=float(F.cosine_similarity(a.unsqueeze(0), b.unsqueeze(0)).item()),
         )
@@ -92,7 +95,10 @@ def _build_request(adapter, batch: dict, noise: torch.Tensor):
 
 
 def _forward_original(adapter, request) -> torch.Tensor:
-    with torch.inference_mode():
+    # no_grad (not inference_mode): inference_mode marks KV buffers as
+    # inference tensors and breaks the following autograd-enabled
+    # differentiable_step.
+    with torch.no_grad():
         out = adapter._engine.step(request)
     return out.clone()
 
@@ -117,7 +123,6 @@ def _forward_differentiable(adapter, request) -> torch.Tensor:
         reset_differentiable_state(sched)
         # with torch.inference_mode():
         out = differentiable_step(sched, request)
-        # out = adapter._engine.step(request)
         return out.clone()
 
 
@@ -155,6 +160,7 @@ def _print_metrics(label: str, metrics: ActionDiffMetrics) -> None:
     print(
         f"  {label:8s}  max_abs={metrics.max_abs:.6e}  "
         f"mean_abs={metrics.mean_abs:.6e}  "
+        f"abs_l2={metrics.abs_l2:.6e}  "
         f"rel_l2={metrics.rel_l2:.6e}  cosine={metrics.cosine:.8f}"
     )
 
@@ -170,6 +176,7 @@ def _aggregate(results: list[SampleResult], field: str) -> ActionDiffMetrics:
     return ActionDiffMetrics(
         max_abs=max(m.max_abs for m in rows),
         mean_abs=sum(m.mean_abs for m in rows) / len(rows),
+        abs_l2=sum(m.abs_l2 for m in rows) / len(rows),
         rel_l2=sum(m.rel_l2 for m in rows) / len(rows),
         cosine=sum(m.cosine for m in rows) / len(rows),
     )

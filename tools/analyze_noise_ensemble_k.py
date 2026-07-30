@@ -3,8 +3,8 @@
 
 Stats match what pack-build actually consumes:
 
-* ``perm_amax``       — ``static_channel_amax`` path (perm_score=activation*)
-* ``act_scale_amax``  — ``per_step_channel_amax`` (DiT per_step act scales)
+* ``perm_amax``       — ``static_cross_channel_amax`` path (perm_score=activation*)
+* ``act_scale_amax``  — ``per_step_cross_channel_amax`` (DiT per_step act scales)
 * ``svd_gptq_cov``    — ``X.T @ X / n`` (SVD activation cov; GPTQ Hessian is
                         the same matrix unnormalized, so seed-similarity matches)
 

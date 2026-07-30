@@ -40,7 +40,7 @@ import analyze_dit_step_activations as dsa  # noqa: E402
 from qvla.adapters import get_adapter  # noqa: E402
 from qvla.adapters.pi05.obs import build_pi05_request  # noqa: E402
 from qvla.adapters.pi05.step_hook import patched_one_step  # noqa: E402
-from qvla.build.fisher import FisherCollector  # noqa: E402
+from qvla.build.fisher import FisherCollector, resolve_fisher_action_dim  # noqa: E402
 from qvla.config import QVLAConfig  # noqa: E402
 from qvla.runtime import list_target_modules  # noqa: E402
 
@@ -125,6 +125,8 @@ def _collect_fisher(
     *,
     num_dit_steps: int,
     noise: torch.Tensor | None,
+    fisher_method: str = "exact",
+    hutchinson_probes: int = 8,
 ) -> dict[str, torch.Tensor]:
     from qvla.build.differentiable_forward import (
         differentiable_inference_context,
@@ -139,7 +141,9 @@ def _collect_fisher(
     runner = sched.expert_runner
 
     with differentiable_inference_context(sched):
-        with FisherCollector(targets, num_dit_steps) as fc:
+        with FisherCollector(
+            targets, num_dit_steps, action_dim=resolve_fisher_action_dim(adapter)
+        ) as fc:
             for batch in batches:
                 fc.begin_sample()
                 reset_differentiable_state(sched)
@@ -152,7 +156,12 @@ def _collect_fisher(
                 with patched_one_step(runner, _step_cb):
                     fc.set_current_step(None)
                     actions = _differentiable_forward(adapter, sched, batch, noise=noise)
-                fc.compute_jacobian_sensitivity(actions, model=model)
+                fc.compute_jacobian_sensitivity(
+                    actions,
+                    model=model,
+                    method=fisher_method,
+                    hutchinson_probes=hutchinson_probes,
+                )
             results = fc.get_results()
 
     return {name: _aggregate_steps(r.sensitivity_per_step()) for name, r in results.items()}
@@ -316,6 +325,21 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Also run Fisher averaged over all samples and report per-sample vs pooled.",
     )
+    p.add_argument(
+        "--fisher-method",
+        choices=("exact", "hutchinson"),
+        default="exact",
+        help=(
+            "Fisher estimator: exact (one backward per action dim) or "
+            "hutchinson (random-projection approximation)."
+        ),
+    )
+    p.add_argument(
+        "--fisher-hutchinson-probes",
+        type=int,
+        default=8,
+        help="Number of random projections when --fisher-method=hutchinson.",
+    )
     p.add_argument("--output-dir", type=Path, required=True)
     args = p.parse_args(argv)
 
@@ -323,6 +347,8 @@ def main(argv: list[str] | None = None) -> int:
         p.error("--calibration-data is required when --calibration-source=file.")
     if args.num_samples < 2:
         p.error("--num-samples must be >= 2.")
+    if args.fisher_hutchinson_probes < 1:
+        p.error("--fisher-hutchinson-probes must be >= 1.")
 
     sample_indices = list(range(args.sample_start, args.sample_start + args.num_samples))
     config = QVLAConfig.pi05_default()
@@ -352,6 +378,8 @@ def main(argv: list[str] | None = None) -> int:
             [_get_calibration_batch(adapter, idx)],
             num_dit_steps=num_dit_steps,
             noise=noise,
+            fisher_method=args.fisher_method,
+            hutchinson_probes=args.fisher_hutchinson_probes,
         )
 
     pooled: dict[str, torch.Tensor] | None = None
@@ -364,6 +392,8 @@ def main(argv: list[str] | None = None) -> int:
             batches,
             num_dit_steps=num_dit_steps,
             noise=noise,
+            fisher_method=args.fisher_method,
+            hutchinson_probes=args.fisher_hutchinson_probes,
         )
 
     print(f"\n=== Fisher sample stability ({len(targets)} layer(s)) ===")

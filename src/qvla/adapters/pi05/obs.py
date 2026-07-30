@@ -27,12 +27,25 @@ def obs_to_transition(obs: dict, *, state_dim: int) -> dict:
     }
 
 
-def build_pi05_request(processor, obs: dict, *, state_dim: int):
+def build_pi05_request(processor, obs: dict | list[dict], *, state_dim: int):
+    """Build a ``PI05Request`` from one observation or a list (batch dim 0)."""
     from phyai.models.pi05.scheduler_ws1_pi05 import PI05Request
 
-    out = processor.preprocess(obs_to_transition(obs, state_dim=state_dim))
+    if isinstance(obs, dict):
+        out = processor.preprocess(obs_to_transition(obs, state_dim=state_dim))
+        return PI05Request(
+            pixel_values=out.pixel_values,
+            input_ids=out.input_ids,
+            lang_lens=out.lang_lens,
+        )
+
+    if not obs:
+        raise ValueError("build_pi05_request() requires a non-empty observation list.")
+    processed = [
+        processor.preprocess(obs_to_transition(item, state_dim=state_dim)) for item in obs
+    ]
     return PI05Request(
-        pixel_values=out.pixel_values,
-        input_ids=out.input_ids,
-        lang_lens=out.lang_lens,
+        pixel_values=torch.cat([p.pixel_values for p in processed], dim=0),
+        input_ids=torch.cat([p.input_ids for p in processed], dim=0),
+        lang_lens=torch.cat([p.lang_lens for p in processed], dim=0),
     )

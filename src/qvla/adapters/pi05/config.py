@@ -65,6 +65,9 @@ class PI05AdapterConfig:
     state_dim: int = 8
     tokenizer_max_length: int = 200
     tokenizer_name: str = "google/paligemma-3b-pt-224"
+    # Engine allocation size. Fisher batching requires this >= fisher_batch_size
+    # before build_model(); pack build sets it automatically when Fisher runs.
+    max_batch_size: int = 1
 
     @classmethod
     def from_checkpoint(cls, checkpoint_path: str | Path, **kwargs) -> PI05AdapterConfig:
