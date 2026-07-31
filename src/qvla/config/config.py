@@ -152,11 +152,14 @@ class QVLAConfig:
     fisher_batch_size: int = 4
 
     # Per-layer random Hadamard seeds are derived from this + qualified layer name.
+    # In global calibration-noise mode, noise index 0 also uses this seed.
     build_seed: int = 0
 
-    # Independent diffusion noises per calibration sample (pi0.5), applied when
-    # calibrating DiT layers (LLM-only passes stay at K=1). Collector aggregates
-    # across them (max amax, sum XᵀX). ``1`` = previous behaviour.
+    # "per_sample" preserves independent noise per calibration sample; "global"
+    # shares model-server-compatible noise across all samples.
+    calibration_noise_mode: Literal["per_sample", "global"] = "per_sample"
+
+    # Number of diffusion noises used while calibrating DiT layers.
     noise_ensemble_k: int = 1
 
     # ---- serialization ---------------------------------------------------
@@ -183,6 +186,7 @@ class QVLAConfig:
             fisher_hutchinson_probes=d.get("fisher_hutchinson_probes", 8),
             fisher_batch_size=d.get("fisher_batch_size", 4),
             build_seed=d.get("build_seed", 0),
+            calibration_noise_mode=d.get("calibration_noise_mode", "per_sample"),
             noise_ensemble_k=d.get("noise_ensemble_k", 1),
         )
 

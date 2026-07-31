@@ -545,12 +545,14 @@ def build_pack(
         adapter,
         build_seed=config.build_seed,
         noise_ensemble_k=config.noise_ensemble_k,
+        mode=config.calibration_noise_mode,
     )
     if config.noise_ensemble_k > 1:
         logger.info(
-            "Noise-ensemble calibration: %d noises per sample (DiT targets only; "
+            "Noise-ensemble calibration: %d noises, mode=%s (DiT targets only; "
             "LLM-only passes use K=1).",
             config.noise_ensemble_k,
+            config.calibration_noise_mode,
         )
 
     fisher_action_dim: int | None = None
@@ -689,6 +691,8 @@ def build_pack(
         meta={
             "model_kind": adapter.model_kind,
             "num_samples": num_samples,
+            "calibration_noise_mode": config.calibration_noise_mode,
+            "calibration_noise_seed": config.build_seed,
             "noise_ensemble_k": config.noise_ensemble_k,
             "build_seconds": round(time.time() - t0, 2),
         },

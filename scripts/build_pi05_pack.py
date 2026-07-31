@@ -179,6 +179,8 @@ def build_config_from_args(args: argparse.Namespace) -> QVLAConfig:
         top["fisher_batch_size"] = args.fisher_batch_size
     if getattr(args, "build_seed", None) is not None:
         top["build_seed"] = args.build_seed
+    if getattr(args, "calibration_noise_mode", None) is not None:
+        top["calibration_noise_mode"] = args.calibration_noise_mode
     if getattr(args, "noise_ensemble_k", None) is not None:
         top["noise_ensemble_k"] = args.noise_ensemble_k
     return config.with_overrides(**top)
@@ -481,8 +483,18 @@ def _add_config_args(parser: argparse.ArgumentParser) -> None:
         default=None,
         dest="build_seed",
         help=(
-            "Seed for reproducible random Hadamard during build "
-            "(per-layer seeds derived from this + layer name; default: 0)."
+            "Seed for reproducible random Hadamard and pi0.5 calibration noise "
+            "(default: 0)."
+        ),
+    )
+    top.add_argument(
+        "--calibration-noise-mode",
+        choices=("per_sample", "global"),
+        default=None,
+        help=(
+            "Calibration diffusion-noise policy: per_sample preserves the original "
+            "independent-noise behaviour; global matches model-server global mode "
+            "when build_seed equals inference_seed (default: per_sample)."
         ),
     )
     top.add_argument(
@@ -491,7 +503,8 @@ def _add_config_args(parser: argparse.ArgumentParser) -> None:
         default=None,
         dest="noise_ensemble_k",
         help=(
-            "Independent diffusion noises per calibration sample (default: 1). "
+            "Diffusion noises used for calibration (default: 1). "
+            "Global noise mode requires K=1. "
             "Applied when calibrating DiT layers; LLM-only pipeline passes stay "
             "at K=1. amax uses max, XᵀX / Hessian accumulate across noises."
         ),
@@ -591,6 +604,11 @@ def run_build(args: argparse.Namespace) -> int:
             f"got {args.fisher_hutchinson_probes}."
         )
     config = build_config_from_args(args)
+    if config.calibration_noise_mode == "global" and config.noise_ensemble_k != 1:
+        raise ValueError(
+            "--calibration-noise-mode global requires --noise-ensemble-k 1, "
+            f"got {config.noise_ensemble_k}."
+        )
     output_path = _auto_output_path(args, config)
     adapter = get_adapter("pi05", **build_adapter_kwargs(args))
 
