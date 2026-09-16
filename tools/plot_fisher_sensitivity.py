@@ -40,7 +40,7 @@ _ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT / "src"))
 
 from qvla.adapters import get_adapter  # noqa: E402
-from qvla.build.fisher import FisherCollector, resolve_fisher_action_dim  # noqa: E402
+from qvla.build.fisher import InputGradFisherCollector, resolve_fisher_action_dim  # noqa: E402
 from qvla.config import QVLAConfig  # noqa: E402
 from qvla.runtime import list_target_modules  # noqa: E402
 
@@ -164,7 +164,7 @@ def _collect_fisher_and_activation(
 ) -> tuple[dict[str, dict[int | None, torch.Tensor]], dict[str, dict[int | None, torch.Tensor]]]:
     """Run Fisher pass; also accumulate per-channel activation energy on the same forwards."""
     from qvla.adapters.pi05.step_hook import patched_one_step
-    from qvla.build.differentiable_forward import (
+    from qvla.adapters.pi05.differentiable_forward import (
         differentiable_inference_context,
         force_eager_runners,
         reset_differentiable_state,
@@ -207,7 +207,7 @@ def _collect_fisher_and_activation(
 
     try:
         with differentiable_inference_context(sched):
-            with FisherCollector(
+            with InputGradFisherCollector(
                 targets, num_dit_steps, action_dim=resolve_fisher_action_dim(adapter)
             ) as fc:
                 for i, batch in enumerate(adapter.iter_calibration_batches(num_samples)):

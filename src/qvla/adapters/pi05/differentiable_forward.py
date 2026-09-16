@@ -18,16 +18,27 @@ import logging
 from typing import TYPE_CHECKING, Any, Iterator
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 
 from phyai.payload import LLMForwardBatch, VisionForwardBatch
 
-from qvla.build.attention_grad import (
+from qvla.adapters.pi05.attention_grad import (
     attach_attention_metadata,
     clear_prefix_kv_tape,
     patch_attention_for_grad,
     restore_attention_for_grad,
+)
+from qvla.build.grad_patches import (
+    linear_with_bias,
+    patch_adarmsnorm_kernels_for_grad,
+    patch_gemma_rmsnorm_kernels_for_grad,
+    patch_linears_for_grad,
+    patch_mlp_activations_for_grad,
+    patch_rope_for_grad,
+    restore_adarmsnorm_kernels_for_grad,
+    restore_gemma_rmsnorm_kernels_for_grad,
+    restore_linears_for_grad,
+    restore_mlp_activations_for_grad,
+    restore_rope_for_grad,
 )
 
 if TYPE_CHECKING:
@@ -37,240 +48,14 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _linear_with_bias(layer: Any, x: torch.Tensor) -> torch.Tensor:
-    """Autograd-safe matmul for phyai ``ReplicatedLinear`` weights."""
-    bias = layer.bias if not getattr(layer, "skip_bias_add", False) else None
-    return F.linear(x, layer.weight, bias)
-
-
-def _linear_forward_with_bias_tuple(layer: Any, x: torch.Tensor) -> tuple[torch.Tensor, Any]:
-    """``F.linear`` forward matching phyai ``LinearBase``'s ``(y, bias)`` contract."""
-    y = _linear_with_bias(layer, x)
-    bias_out = layer.bias if getattr(layer, "skip_bias_add", False) else None
-    return y, bias_out
-
-
-def _is_grad_linear(mod: nn.Module) -> bool:
-    """True for phyai linears that should use ``F.linear`` under autograd."""
-    from qvla.runtime.quant_linear import QuantLinear
-    from qvla.runtime.wrap import _is_linear_like
-
-    if isinstance(mod, QuantLinear):
-        return False
-    return _is_linear_like(mod)
-
-
-def _patch_linears_for_grad(root: nn.Module, *, log_label: str) -> list[Any]:
-    patched: list[Any] = []
-    for mod in root.modules():
-        if not _is_grad_linear(mod):
-            continue
-        if getattr(mod, "_qvla_linear_grad_patched", False):
-            continue
-        orig_forward = mod.forward
-
-        def make_forward(layer: Any, original: Any):
-            def forward(x: torch.Tensor, *args: Any, **kwargs: Any):
-                if torch.is_grad_enabled():
-                    return _linear_forward_with_bias_tuple(layer, x)
-                return original(x, *args, **kwargs)
-
-            return forward
-
-        mod._qvla_orig_forward = orig_forward  # type: ignore[attr-defined]
-        mod.forward = make_forward(mod, orig_forward)  # type: ignore[method-assign]
-        mod._qvla_linear_grad_patched = True
-        patched.append(mod)
-    if patched:
-        logger.info(
-            "Patched %d %s Linear(s) to F.linear for autograd.",
-            len(patched),
-            log_label,
-        )
-    return patched
-
-
-def patch_expert_linears_for_grad(expert_stack: Any) -> list[Any]:
-    """Route expert-stack linears through ``F.linear`` when grad is needed.
-
-    FlashInfer GEMM (the default phyai linear backend) has no autograd.  During
-    the Fisher / sensitivity passes the expert stack is still full-precision, so
-    without this patch gradients stop at the first ``qkv_proj`` and every DiT
-    layer reports zero Fisher sensitivity.
-    """
-    return _patch_linears_for_grad(expert_stack, log_label="expert")
-
-
-def patch_llm_linears_for_grad(paligemma_lm: Any) -> list[Any]:
-    """Route paligemma prefix linears through ``F.linear`` when grad is needed."""
-    return _patch_linears_for_grad(paligemma_lm, log_label="LLM")
-
-
-def restore_expert_linears_for_grad(patched: list[Any]) -> None:
-    for mod in patched:
-        if getattr(mod, "_qvla_linear_grad_patched", False):
-            mod.forward = mod._qvla_orig_forward  # type: ignore[method-assign]
-            mod._qvla_linear_grad_patched = False
-
-
-def patch_expert_norms_for_grad(scheduler: Any) -> list[Any]:
-    """Switch expert AdaRMSNorm kernels to the torch reference when grad is needed.
-
-    The default ``phyai-kernel`` Triton path has no autograd, which disconnects
-    the DiT stack even when attention and action-head patches are active.
-    """
-    from phyai.layers.layer_norm import AdaRMSNorm, _torch_adarmsnorm
-
-    patched: list[Any] = []
-    stack = scheduler.expert_runner.expert_stack
-    for mod in stack.modules():
-        if not isinstance(mod, AdaRMSNorm):
-            continue
-        if getattr(mod, "_qvla_torch_adarms_patched", False):
-            continue
-        mod._qvla_orig_adarms_kernel = mod._adarms_kernel  # type: ignore[attr-defined]
-        mod._adarms_kernel = _torch_adarmsnorm
-        mod._qvla_torch_adarms_patched = True
-        patched.append(mod)
-    if patched:
-        logger.info("Patched %d expert AdaRMSNorm module(s) to torch backend.", len(patched))
-    return patched
-
-
-def restore_expert_norms_for_grad(patched: list[Any]) -> None:
-    for mod in patched:
-        if getattr(mod, "_qvla_torch_adarms_patched", False):
-            mod._adarms_kernel = mod._qvla_orig_adarms_kernel  # type: ignore[attr-defined]
-            mod._qvla_torch_adarms_patched = False
-
-
-def _gelu_tanh_and_mul_torch(fused: torch.Tensor) -> torch.Tensor:
-    gate, up = fused.chunk(2, dim=-1)
-    return F.gelu(gate, approximate="tanh") * up
-
-
-def _torch_gemma_rmsnorm(
-    x: torch.Tensor, weight: torch.Tensor, eps: float
-) -> torch.Tensor:
-    needs_reshape = x.dim() != 2
-    if needs_reshape:
-        orig_shape = x.shape
-        x = x.contiguous().reshape(-1, orig_shape[-1])
-    var = x.pow(2).mean(dim=-1, keepdim=True)
-    out = x * torch.rsqrt(var + eps) * (1.0 + weight)
-    if needs_reshape:
-        out = out.reshape(orig_shape)
-    return out
-
-
-def _patch_mlp_activations_for_grad(root: nn.Module, *, log_label: str) -> list[Any]:
-    from phyai.layers.mlp.dense_mlp import DenseMLP
-
-    patched: list[Any] = []
-    for mod in root.modules():
-        if not isinstance(mod, DenseMLP) or not mod.gated or mod._act_and_mul is None:
-            continue
-        if getattr(mod, "_qvla_act_patched", False):
-            continue
-        orig_act = mod._act_and_mul
-
-        def make_act(original):
-            def act_and_mul(fused: torch.Tensor) -> torch.Tensor:
-                if torch.is_grad_enabled():
-                    return _gelu_tanh_and_mul_torch(fused)
-                return original(fused)
-
-            return act_and_mul
-
-        mod._qvla_orig_act_and_mul = orig_act  # type: ignore[attr-defined]
-        mod._act_and_mul = make_act(orig_act)
-        mod._qvla_act_patched = True
-        patched.append(mod)
-    if patched:
-        logger.info(
-            "Patched %d %s DenseMLP activation(s) to torch backend.",
-            len(patched),
-            log_label,
-        )
-    return patched
-
-
-def patch_rope_for_grad(rope: Any) -> Any | None:
-    """Use eager RoPE when autograd is needed (flashinfer has no backward)."""
-    if getattr(rope, "_qvla_rope_grad_patched", False):
-        return None
-    orig_forward = rope.forward
-
-    def forward(positions: torch.Tensor, q: torch.Tensor, k: torch.Tensor):
-        if torch.is_grad_enabled():
-            return rope._forward_eager(positions, q, k)
-        return orig_forward(positions, q, k)
-
-    rope._qvla_orig_forward = orig_forward  # type: ignore[attr-defined]
-    rope.forward = forward  # type: ignore[method-assign]
-    rope._qvla_rope_grad_patched = True
-    logger.info("Patched RotaryEmbedding for autograd (eager RoPE fallback).")
-    return rope
-
-
-def restore_rope_for_grad(rope: Any | None) -> None:
-    if rope is None or not getattr(rope, "_qvla_rope_grad_patched", False):
-        return
-    rope.forward = rope._qvla_orig_forward  # type: ignore[method-assign]
-    rope._qvla_rope_grad_patched = False
-
-
-def patch_expert_mlp_activations_for_grad(expert_stack: Any) -> list[Any]:
-    """Route GeGLU through torch when grad is needed (flashinfer has no backward)."""
-    return _patch_mlp_activations_for_grad(expert_stack, log_label="expert")
-
-
-def patch_llm_mlp_activations_for_grad(paligemma_lm: Any) -> list[Any]:
-    """Route paligemma GeGLU through torch when grad is needed."""
-    return _patch_mlp_activations_for_grad(paligemma_lm, log_label="LLM")
-
-
-def restore_expert_mlp_activations_for_grad(patched: list[Any]) -> None:
-    for mod in patched:
-        if getattr(mod, "_qvla_act_patched", False):
-            mod._act_and_mul = mod._qvla_orig_act_and_mul  # type: ignore[attr-defined]
-            mod._qvla_act_patched = False
-
-
-def patch_llm_norms_for_grad(scheduler: Any) -> list[Any]:
-    """Switch paligemma RMSNorm kernels to torch when grad is needed."""
-    from phyai.layers.layer_norm import GemmaRMSNorm
-
-    patched: list[Any] = []
-    for mod in scheduler.llm_runner.paligemma_lm.modules():
-        if not isinstance(mod, GemmaRMSNorm):
-            continue
-        if getattr(mod, "_qvla_torch_rms_patched", False):
-            continue
-        mod._qvla_orig_rmsnorm = mod._rmsnorm  # type: ignore[attr-defined]
-        mod._rmsnorm = _torch_gemma_rmsnorm
-        mod._qvla_torch_rms_patched = True
-        patched.append(mod)
-    if patched:
-        logger.info("Patched %d LLM GemmaRMSNorm module(s) to torch backend.", len(patched))
-    return patched
-
-
-def restore_llm_norms_for_grad(patched: list[Any]) -> None:
-    for mod in patched:
-        if getattr(mod, "_qvla_torch_rms_patched", False):
-            mod._rmsnorm = mod._qvla_orig_rmsnorm  # type: ignore[attr-defined]
-            mod._qvla_torch_rms_patched = False
-
-
 def patch_llm_ops_for_grad(scheduler: Any) -> tuple[Any | None, list[Any], list[Any], list[Any]]:
     """Patch paligemma prefix linears, norms, MLP activations, and RoPE for autograd."""
     lm = scheduler.llm_runner.paligemma_lm
     return (
         patch_rope_for_grad(scheduler.llm_runner.rope),
-        patch_llm_linears_for_grad(lm),
-        patch_llm_norms_for_grad(scheduler),
-        patch_llm_mlp_activations_for_grad(lm),
+        patch_linears_for_grad(lm, log_label="LLM"),
+        patch_gemma_rmsnorm_kernels_for_grad(lm, log_label="LLM"),
+        patch_mlp_activations_for_grad(lm, log_label="LLM"),
     )
 
 
@@ -281,9 +66,9 @@ def restore_llm_ops_for_grad(
     mlps: list[Any],
 ) -> None:
     restore_rope_for_grad(rope)
-    restore_expert_linears_for_grad(linears)
-    restore_llm_norms_for_grad(norms)
-    restore_expert_mlp_activations_for_grad(mlps)
+    restore_linears_for_grad(linears)
+    restore_gemma_rmsnorm_kernels_for_grad(norms)
+    restore_mlp_activations_for_grad(mlps)
 
 
 def patch_expert_ops_for_grad(
@@ -292,9 +77,9 @@ def patch_expert_ops_for_grad(
     """Patch RoPE, linears, norms, and MLP activations for autograd."""
     stack = scheduler.expert_runner.expert_stack
     rope = patch_rope_for_grad(scheduler.expert_runner.rope)
-    norms = patch_expert_norms_for_grad(scheduler)
-    linears = patch_expert_linears_for_grad(stack)
-    mlps = patch_expert_mlp_activations_for_grad(stack)
+    norms = patch_adarmsnorm_kernels_for_grad(stack, log_label="expert")
+    linears = patch_linears_for_grad(stack, log_label="expert")
+    mlps = patch_mlp_activations_for_grad(stack, log_label="expert")
     return rope, norms, mlps, linears
 
 
@@ -305,9 +90,9 @@ def restore_expert_ops_for_grad(
     linears: list[Any] | None = None,
 ) -> None:
     restore_rope_for_grad(rope)
-    restore_expert_norms_for_grad(norms)
-    restore_expert_mlp_activations_for_grad(mlps)
-    restore_expert_linears_for_grad(linears or [])
+    restore_adarmsnorm_kernels_for_grad(norms)
+    restore_mlp_activations_for_grad(mlps)
+    restore_linears_for_grad(linears or [])
 
 
 @contextlib.contextmanager
@@ -349,12 +134,12 @@ def patch_action_heads_for_grad(scheduler: Any) -> tuple[Any, Any, Any] | None:
 
     def embed_action(x: torch.Tensor) -> torch.Tensor:
         if torch.is_grad_enabled():
-            return _linear_with_bias(heads.action_in_proj, x)
+            return linear_with_bias(heads.action_in_proj, x)
         return orig_embed(x)
 
     def project_action(x: torch.Tensor) -> torch.Tensor:
         if torch.is_grad_enabled():
-            return _linear_with_bias(heads.action_out_proj, x)
+            return linear_with_bias(heads.action_out_proj, x)
         return orig_project(x)
 
     heads.embed_action = embed_action  # type: ignore[method-assign]
@@ -571,21 +356,10 @@ __all__ = [
     "differentiable_step",
     "force_eager_runners",
     "patch_action_heads_for_grad",
-    "patch_expert_linears_for_grad",
-    "patch_expert_mlp_activations_for_grad",
-    "patch_expert_norms_for_grad",
     "patch_expert_ops_for_grad",
-    "patch_llm_linears_for_grad",
-    "patch_llm_mlp_activations_for_grad",
-    "patch_llm_norms_for_grad",
     "patch_llm_ops_for_grad",
-    "patch_rope_for_grad",
     "reset_differentiable_state",
     "restore_action_heads_for_grad",
-    "restore_expert_linears_for_grad",
-    "restore_expert_mlp_activations_for_grad",
-    "restore_expert_norms_for_grad",
     "restore_expert_ops_for_grad",
     "restore_llm_ops_for_grad",
-    "restore_rope_for_grad",
 ]

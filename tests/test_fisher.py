@@ -13,7 +13,11 @@ _PKG_SRC = Path(__file__).resolve().parent.parent / "src"
 if str(_PKG_SRC) not in sys.path:
     sys.path.insert(0, str(_PKG_SRC))
 
-from qvla.build.fisher import FisherCollector, LayerFisherResult
+from qvla.build.fisher import (
+    InputGradFisherCollector,
+    LayerFisherResult,
+    OutputHessianFisherCollector,
+)
 from rotation_helpers import fit_rotation
 
 
@@ -63,7 +67,7 @@ def _make_targets(
 
 
 # -------------------------------------------------------------------- #
-# FisherCollector — basic sanity                                        #
+# InputGradFisherCollector — basic sanity                                        #
 # -------------------------------------------------------------------- #
 
 
@@ -71,7 +75,7 @@ def test_fisher_collector_captures_nonzero_sensitivity():
     model = _ToyModel(d_in=32, d_hidden=16, d_out=7)
     targets = _make_targets(model, scope="dit")
 
-    with FisherCollector(targets, action_dim=7) as fc:
+    with InputGradFisherCollector(targets, action_dim=7) as fc:
         fc.begin_sample()
         x = torch.randn(2, 32, requires_grad=True)
         actions = model(x)
@@ -92,7 +96,7 @@ def test_fisher_collector_multiple_samples():
     model = _ToyModel()
     targets = _make_targets(model)
 
-    with FisherCollector(targets, action_dim=7) as fc:
+    with InputGradFisherCollector(targets, action_dim=7) as fc:
         for _ in range(3):
             fc.begin_sample()
             x = torch.randn(2, 32, requires_grad=True)
@@ -114,7 +118,7 @@ def test_fisher_collector_batch_matches_per_sample_mean():
     targets = _make_targets(model, scope="llm")
     x = torch.randn(2, 8, requires_grad=True)
 
-    with FisherCollector(targets, action_dim=3) as fc:
+    with InputGradFisherCollector(targets, action_dim=3) as fc:
         fc.begin_sample()
         actions = model(x)
         fc.compute_jacobian_sensitivity(actions, model=model, action_timestep="0")
@@ -122,7 +126,7 @@ def test_fisher_collector_batch_matches_per_sample_mean():
             n: r.aggregate("uniform").clone() for n, r in fc.get_results().items()
         }
 
-    with FisherCollector(targets, action_dim=3) as fc:
+    with InputGradFisherCollector(targets, action_dim=3) as fc:
         for b in range(2):
             fc.begin_sample()
             xb = x[b : b + 1].detach().requires_grad_(True)
@@ -141,7 +145,7 @@ def test_fisher_collector_dit_per_step():
     model = _ToyDiTModel(d=16, d_out=7, num_steps=3)
     targets = _make_targets(model, scope="dit")
 
-    with FisherCollector(targets, num_dit_steps=3, action_dim=7) as fc:
+    with InputGradFisherCollector(targets, num_dit_steps=3, action_dim=7) as fc:
         fc.begin_sample()
         x = torch.randn(1, 16, requires_grad=True)
 
@@ -169,7 +173,7 @@ def test_fisher_hutchinson_matches_exact_on_toy():
     targets = _make_targets(model, scope="llm")
     x_data = torch.randn(4, 12)
 
-    with FisherCollector(targets, action_dim=5) as fc_exact:
+    with InputGradFisherCollector(targets, action_dim=5) as fc_exact:
         fc_exact.begin_sample()
         x = x_data.clone().requires_grad_(True)
         actions = model(x)
@@ -180,7 +184,7 @@ def test_fisher_hutchinson_matches_exact_on_toy():
             n: r.aggregate("uniform").clone() for n, r in fc_exact.get_results().items()
         }
 
-    with FisherCollector(targets, action_dim=5) as fc_h:
+    with InputGradFisherCollector(targets, action_dim=5) as fc_h:
         fc_h.begin_sample()
         x = x_data.clone().requires_grad_(True)
         actions = model(x)
@@ -204,7 +208,7 @@ def test_fisher_collector_llm_no_step():
     model = _ToyModel()
     targets = _make_targets(model, scope="llm")
 
-    with FisherCollector(targets, action_dim=7) as fc:
+    with InputGradFisherCollector(targets, action_dim=7) as fc:
         fc.begin_sample()
         fc.set_current_step(5)
         x = torch.randn(2, 32, requires_grad=True)
@@ -224,7 +228,7 @@ def test_fisher_collector_no_grad_raises():
     model = _ToyModel()
     targets = _make_targets(model)
 
-    with FisherCollector(targets, action_dim=7) as fc:
+    with InputGradFisherCollector(targets, action_dim=7) as fc:
         fc.begin_sample()
         with torch.no_grad():
             x = torch.randn(2, 32)
@@ -247,7 +251,7 @@ def test_fisher_3d_actions():
     model = _ChunkedModel()
     targets = _make_targets(model)
 
-    with FisherCollector(targets, action_dim=7) as fc:
+    with InputGradFisherCollector(targets, action_dim=7) as fc:
         fc.begin_sample()
         x = torch.randn(2, 16, requires_grad=True)
         actions = model(x)
@@ -327,6 +331,245 @@ def test_fisher_action_timestep_bad_text_raises():
     actions = torch.randn(1, 50, 32)
     with pytest.raises(ValueError, match="integer indices"):
         select_fisher_actions(actions, timestep="sampled", action_dim=7)
+
+
+# -------------------------------------------------------------------- #
+# OutputHessianFisherCollector                                          #
+# -------------------------------------------------------------------- #
+
+
+def test_output_hessian_matches_closed_form():
+    """``F_c = Σ_t S_t · x_{t,c}²``  with  ``S_t = Σ_{i,o} (∂a_i/∂y_{t,o})²``.
+
+    Wire up a single linear where actions are exactly ``y.reshape(B, T·N, 1)``
+    so each action dim is a one-hot projection of one output-channel/token
+    slot. Then the closed-form reduces to ``F_c = 2 · Σ_t x_{t,c}²`` (each
+    (t,o) contributes 1 to S_t exactly ``N`` times per token — here N=2).
+    """
+
+    K, N = 3, 2
+
+    class _M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lin = nn.Linear(K, N, bias=False)
+
+        def forward(self, x):  # x: (B, T, K)
+            y = self.lin(x)  # (B, T, N)
+            # Fisher expects (B, T_out, A). Flatten (T, N) into the action
+            # axis so each (t, o) slot is exactly one action DoF.
+            return y.reshape(x.shape[0], 1, -1)
+
+    torch.manual_seed(0)
+    model = _M()
+    x = torch.tensor([[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]], requires_grad=True)
+    targets = _make_targets(model, scope="llm")
+
+    T = int(x.shape[1])
+    with OutputHessianFisherCollector(targets, action_dim=T * N) as fc:
+        fc.begin_sample()
+        actions = model(x)
+        fc.compute_jacobian_sensitivity(actions, model=model)
+        result = fc.get_results()["lin"]
+        sens = result.aggregate("uniform")
+
+    # F_c = 2 · Σ_t x_{t,c}² (see docstring).
+    expected = 2.0 * (x.detach() ** 2).sum(dim=1).reshape(-1)
+    assert sens.shape == (K,)
+    assert torch.allclose(sens, expected, rtol=1e-5, atol=1e-6), (
+        f"got {sens.tolist()}, expected {expected.tolist()}"
+    )
+
+
+def test_output_hessian_shape_and_nonzero_on_toy():
+    torch.manual_seed(1)
+    model = _ToyModel(d_in=32, d_hidden=16, d_out=7)
+    targets = _make_targets(model, scope="dit")
+
+    with OutputHessianFisherCollector(targets, action_dim=7) as fc:
+        fc.begin_sample()
+        x = torch.randn(2, 32, requires_grad=True)
+        actions = model(x)
+        fc.compute_jacobian_sensitivity(actions, model=model)
+        results = fc.get_results()
+
+    assert set(results) == {"linear_a", "linear_b"}
+    for r in results.values():
+        agg = r.aggregate("uniform")
+        assert agg.shape == (r.in_features,)
+    # linear_b takes ReLU output which has grad → must be non-zero.
+    assert results["linear_b"].aggregate("uniform").abs().sum().item() > 0
+
+
+def test_output_hessian_differs_from_input_grad():
+    """The two collectors measure genuinely different quantities."""
+    torch.manual_seed(2)
+    d_in, d_hidden, d_out = 24, 10, 5
+    model = _ToyModel(d_in=d_in, d_hidden=d_hidden, d_out=d_out)
+    targets = _make_targets(model, scope="llm")
+    x_data = torch.randn(3, d_in)
+
+    with InputGradFisherCollector(targets, action_dim=d_out) as fc:
+        fc.begin_sample()
+        x = x_data.clone().requires_grad_(True)
+        fc.compute_jacobian_sensitivity(model(x), model=model)
+        ig = {n: r.aggregate("uniform").clone() for n, r in fc.get_results().items()}
+
+    with OutputHessianFisherCollector(targets, action_dim=d_out) as fc:
+        fc.begin_sample()
+        x = x_data.clone().requires_grad_(True)
+        fc.compute_jacobian_sensitivity(model(x), model=model)
+        oh = {n: r.aggregate("uniform").clone() for n, r in fc.get_results().items()}
+
+    # Numerically distinct — measured quantities have different units.
+    for name in ig:
+        assert not torch.allclose(ig[name], oh[name], rtol=1e-2, atol=1e-3), name
+
+
+def test_output_hessian_hutchinson_matches_exact():
+    """Hutchinson estimator must converge to exact on a small model."""
+    torch.manual_seed(3)
+    model = _ToyModel(d_in=12, d_hidden=6, d_out=4)
+    targets = _make_targets(model, scope="llm")
+    x_data = torch.randn(4, 12)
+
+    with OutputHessianFisherCollector(targets, action_dim=4) as fc:
+        fc.begin_sample()
+        x = x_data.clone().requires_grad_(True)
+        fc.compute_jacobian_sensitivity(
+            model(x), model=model, action_timestep="0", method="exact"
+        )
+        exact = {n: r.aggregate("uniform").clone() for n, r in fc.get_results().items()}
+
+    with OutputHessianFisherCollector(targets, action_dim=4) as fc:
+        fc.begin_sample()
+        x = x_data.clone().requires_grad_(True)
+        fc.compute_jacobian_sensitivity(
+            model(x),
+            model=model,
+            action_timestep="0",
+            method="hutchinson",
+            hutchinson_probes=512,
+        )
+        approx = {n: r.aggregate("uniform").clone() for n, r in fc.get_results().items()}
+
+    for name in exact:
+        assert torch.allclose(approx[name], exact[name], rtol=0.35, atol=1e-4), name
+
+
+def test_output_hessian_dit_per_step_records_all_steps():
+    model = _ToyDiTModel(d=16, d_out=7, num_steps=3)
+    targets = _make_targets(model, scope="dit")
+
+    with OutputHessianFisherCollector(
+        targets, num_dit_steps=3, action_dim=7
+    ) as fc:
+        fc.begin_sample()
+        x = torch.randn(1, 16, requires_grad=True)
+        for step in range(3):
+            fc.set_current_step(step)
+            x = x + model.step_linear(x)
+        fc.set_current_step(None)
+        fc.compute_jacobian_sensitivity(
+            model.out_proj(x).unsqueeze(1), model=model
+        )
+        per_step = fc.get_results()["step_linear"].sensitivity_per_step()
+
+    assert set(per_step.keys()) == {0, 1, 2}
+
+
+def test_output_hessian_no_grad_raises():
+    model = _ToyModel()
+    targets = _make_targets(model)
+
+    with OutputHessianFisherCollector(targets, action_dim=7) as fc:
+        fc.begin_sample()
+        with torch.no_grad():
+            x = torch.randn(2, 32)
+            actions = model(x)
+        with pytest.raises(RuntimeError, match="no grad_fn"):
+            fc.compute_jacobian_sensitivity(actions, model=model)
+
+
+def test_output_hessian_captures_tuple_returning_linear():
+    """phyai LinearBase returns ``(y, bias)``; the hook must unwrap ``y``."""
+
+    class _TupleLinear(nn.Module):
+        def __init__(self, d_in: int, d_out: int) -> None:
+            super().__init__()
+            self.in_features = d_in
+            self.out_features = d_out
+            self.weight = nn.Parameter(torch.randn(d_out, d_in) * 0.1)
+            self.bias = nn.Parameter(torch.zeros(d_out))
+
+        def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            return torch.nn.functional.linear(x, self.weight, self.bias), self.bias
+
+    class _M(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.lin = _TupleLinear(8, 4)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            y, _ = self.lin(x)
+            return y.unsqueeze(1)
+
+    torch.manual_seed(0)
+    model = _M()
+    targets = [("lin", "llm", model.lin)]
+    with OutputHessianFisherCollector(targets, action_dim=4) as fc:
+        fc.begin_sample()
+        x = torch.randn(2, 8, requires_grad=True)
+        actions = model(x)
+        fc.compute_jacobian_sensitivity(actions, model=model)
+        sens = fc.get_results()["lin"].aggregate("uniform")
+
+    assert sens.shape == (8,)
+    assert sens.abs().sum().item() > 0
+
+
+def test_output_hessian_rejects_unexpected_output_type():
+    class _BadLinear(nn.Module):
+        in_features = 4
+        out_features = 2
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(torch.randn(2, 4))
+
+        def forward(self, x: torch.Tensor) -> dict:
+            return {"y": x @ self.weight.T}
+
+    class _M(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.lin = _BadLinear()
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return self.lin(x)["y"].unsqueeze(1)
+
+    model = _M()
+    targets = [("lin", "llm", model.lin)]
+    with OutputHessianFisherCollector(targets, action_dim=2) as fc:
+        fc.begin_sample()
+        x = torch.randn(1, 4, requires_grad=True)
+        with pytest.raises(RuntimeError, match="unexpected forward output type"):
+            _ = model(x)
+
+
+def test_fisher_backward_raises_when_no_layers_captured():
+    """Actions on the graph but target hooks never recorded → fail loud."""
+    model = _ToyModel(d_in=8, d_hidden=4, d_out=3)
+    # Hook a module that is never called in forward.
+    orphan = nn.Linear(8, 4)
+    targets = [("orphan", "llm", orphan)]
+
+    with InputGradFisherCollector(targets, action_dim=3) as fc:
+        fc.begin_sample()
+        x = torch.randn(1, 8, requires_grad=True)
+        actions = model(x)
+        with pytest.raises(RuntimeError, match="no target layer captured"):
+            fc.compute_jacobian_sensitivity(actions, model=model)
 
 
 # -------------------------------------------------------------------- #
@@ -413,7 +656,7 @@ def test_policy_rotation_zero_sensitivity_uses_policy_mode():
         sensitivity=sens,
         perm_score="fisher",
     )
-    assert rot.meta is not None and rot.meta.get("perm_score_used") == "fisher"
+    assert rot.perm_score_used == "fisher"
 
 
 def test_policy_rotation_shape_validation():
@@ -441,7 +684,7 @@ def test_fit_rotation_dispatches_policy():
         sensitivity=sens,
         perm_score="fisher",
     )
-    assert rot.meta is not None and rot.meta.get("perm_score_used") == "fisher"
+    assert rot.perm_score_used == "fisher"
     assert rot.u_blocks is not None
     assert rot.u_blocks.shape == (2, 16, 16)
 
@@ -470,7 +713,11 @@ def test_config_needs_fisher():
     assert not cfg.needs_fisher
 
     cfg_policy = cfg.with_overrides(
-        dit=replace(cfg.dit, perm_score="fisher")
+        dit=replace(
+            cfg.dit,
+            pipeline=("perm", "svd", "hadamard"),
+            perm_score="fisher",
+        )
     )
     assert cfg_policy.needs_fisher
 
@@ -513,9 +760,9 @@ def test_config_fisher_fields_serialize():
 
 def test_expert_linear_grad_patch_restores_autograd():
     """FlashInfer-like linears break the graph; the Fisher patch must reconnect it."""
-    from qvla.build.differentiable_forward import (
-        patch_expert_linears_for_grad,
-        restore_expert_linears_for_grad,
+    from qvla.build.grad_patches import (
+        patch_linears_for_grad,
+        restore_linears_for_grad,
     )
 
     class _FlashInferLikeLinear(nn.Module):
@@ -547,7 +794,7 @@ def test_expert_linear_grad_patch_restores_autograd():
     y = stack(x)
     assert not (y.requires_grad or y.grad_fn is not None)
 
-    patched = patch_expert_linears_for_grad(stack)
+    patched = patch_linears_for_grad(stack, log_label="expert")
     assert len(patched) == 1
 
     x2 = torch.randn(2, 8, requires_grad=True)
@@ -556,7 +803,7 @@ def test_expert_linear_grad_patch_restores_autograd():
     assert x2.grad is not None
     assert x2.grad.abs().sum().item() > 0
 
-    restore_expert_linears_for_grad(patched)
+    restore_linears_for_grad(patched)
 
 
 # -------------------------------------------------------------------- #

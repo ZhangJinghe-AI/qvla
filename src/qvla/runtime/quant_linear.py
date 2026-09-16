@@ -16,12 +16,16 @@ Forward pass
 ------------
 ::
 
-    1.  x_rot  = R(x)                              # block-diag rotation
-    2.  x_q, s_x = quantize_activation(x_rot)      # int4 + per-token / per-step scale
+    1.  x_t   = pipeline(x)                        # clip → smooth → rotation
+    2.  x_q, s_x = quantize_activation(x_t)       # int4 + per-token / per-step scale
     3.  W_fp = dequant(qweight, weight_scale)      # int4 -> bf16 dense
-    4.  y    = matmul(x_q.float() * s_x, W_fp.T)   # bf16 GEMM
-    4a. y   += matmul(x_rot, residual.T)           # only if residual is present
+    4.  y    = matmul(x_q.float() * s_x, W_fp.T)  # bf16 GEMM
+    4a. y   += matmul(x_t, residual.T)             # only if residual is present
     5.  return y + bias
+
+All input-side transforms (clip, smooth, rotation) are unified in the
+pipeline stored on :class:`~qvla.core.pipeline.Transform`. Steps that are
+absent from the pipeline are skipped.
 
 We do *not* yet ship a fused int4 × int4 GEMM kernel — step 3 materializes a
 dense bf16 weight on the fly and step 4 uses the regular bf16 matmul. This is
@@ -47,8 +51,16 @@ import torch
 import torch.nn as nn
 
 from qvla.core.pack import LayerPack
-from qvla.core.quantize import is_no_quant, symmetric_quant_range
-from qvla.core.rotation import apply_input_pipeline
+from qvla.core.quantize import (
+    is_no_quant,
+    symmetric_quant_range,
+    FP4_E2M1_MAX,
+    _fp4_e2m1_dequantize,
+    _fp4_e2m1_quantize,
+    nvfp4_dequantize,
+    nvfp4_quantize_activation,
+)
+from qvla.core.pipeline import apply_input_pipeline
 
 
 logger = logging.getLogger(__name__)
@@ -61,6 +73,7 @@ class _RuntimeFlags:
     return_tuple: bool        # phyai linears return ``(y, bias_or_None)``
     skip_bias_add: bool       # phyai's `skip_bias_add` flag
     output_dtype: torch.dtype # cast the GEMM output to this before returning
+    nvfp_activation_num_samples: int | None
 
 
 class QuantLinear(nn.Module):
@@ -82,25 +95,79 @@ class QuantLinear(nn.Module):
         skip_bias_add: bool,
         output_dtype: torch.dtype = torch.bfloat16,
         device: torch.device | str = "cuda",
+        nvfp_activation_num_samples: int | None = None,
     ) -> None:
         super().__init__()
         self.in_features = pack.in_features
         self.out_features = pack.out_features
         self.weight_bits = pack.weight_bits
+        self.weight_format = getattr(pack, "weight_format", "int")
         self.act_bits = pack.act_bits
+        self.act_format = getattr(pack, "act_format", "int")
+        if self.weight_format not in ("int", "fp", "nvfp"):
+            raise ValueError(
+                f"QuantLinear({pack.name!r}): weight_format must be "
+                f"'int', 'fp', or 'nvfp', got {self.weight_format!r}."
+            )
+        if self.act_format not in ("int", "fp", "nvfp"):
+            raise ValueError(
+                f"QuantLinear({pack.name!r}): act_format must be "
+                f"'int', 'fp', or 'nvfp', got {self.act_format!r}."
+            )
         self._weight_no_quant = is_no_quant(self.weight_bits)
         self._act_no_quant = is_no_quant(self.act_bits)
         self._act_qmin, self._act_qmax = symmetric_quant_range(self.act_bits)
+        self._act_is_fp = self.act_format == "fp"
+        self._act_is_nvfp = self.act_format == "nvfp"
         self.group_size = pack.group_size
         self.scope = pack.scope
         self.act_scale_mode = pack.act_scale_mode
         self.act_scale_granularity = pack.act_scale_granularity
         self.name = pack.name
-
+        if self.weight_format == "nvfp" and self.group_size != 16:
+            raise ValueError(
+                f"QuantLinear({pack.name!r}): NVFP4 weight requires group_size=16, "
+                f"got {self.group_size}."
+            )
+        if self.act_format == "nvfp" and (
+            self.act_scale_mode != "dynamic"
+            or self.act_scale_granularity != "per_block"
+        ):
+            raise ValueError(
+                f"QuantLinear({pack.name!r}): NVFP4 activation requires "
+                "act_scale_mode='dynamic' and "
+                "act_scale_granularity='per_block'."
+            )
+        if self.act_scale_granularity == "per_block":
+            if self.act_scale_mode != "dynamic":
+                raise ValueError(
+                    f"QuantLinear({pack.name!r}): per_block activation scaling "
+                    f"requires dynamic mode, got {self.act_scale_mode!r}."
+                )
+            if self.group_size <= 0 or self.in_features % self.group_size != 0:
+                raise ValueError(
+                    f"QuantLinear({pack.name!r}): in_features={self.in_features} "
+                    f"must be divisible by positive group_size={self.group_size} "
+                    "for per_block activation scaling."
+                )
+        if self.act_format == "nvfp" and self.group_size != 16:
+            raise ValueError(
+                f"QuantLinear({pack.name!r}): NVFP4 activation requires "
+                f"group_size=16, got {self.group_size}."
+            )
+        if self._act_is_nvfp and (
+            nvfp_activation_num_samples is None
+            or nvfp_activation_num_samples <= 0
+        ):
+            raise ValueError(
+                f"QuantLinear({pack.name!r}): NVFP4 activation requires an "
+                "explicit positive nvfp_activation_num_samples."
+            )
         self._flags = _RuntimeFlags(
             return_tuple=return_tuple,
             skip_bias_add=skip_bias_add,
             output_dtype=output_dtype,
+            nvfp_activation_num_samples=nvfp_activation_num_samples,
         )
 
         device_t = torch.device(device)
@@ -116,6 +183,16 @@ class QuantLinear(nn.Module):
             pack.weight_scale.to(device_t, dtype=torch.float32).contiguous(),
             persistent=False,
         )
+
+        if getattr(pack, "weight_scale_2", None) is not None:
+            self.register_buffer(
+                "weight_scale_2",
+                pack.weight_scale_2.to(device_t, dtype=torch.float32).contiguous(),
+                persistent=False,
+            )
+            self._has_weight_scale_2 = True
+        else:
+            self._has_weight_scale_2 = False
 
         if self._weight_no_quant:
             fp_weight = pack.extras.get("fp_weight")
@@ -135,9 +212,35 @@ class QuantLinear(nn.Module):
         else:
             self.bias = None  # type: ignore[assignment]
 
-        # ---- rotation: U blocks + optional zigzag perm + pipeline -----------
+        # ---- transform pipeline (clip → smooth → rotation) ------------------
+        # All input-side transforms live on the Transform object.
         rot = pack.rotation
-        self._rotation_pipeline = rot.pipeline
+        self._transform_pipeline = rot.pipeline
+        self._has_smooth = rot.smooth_scale is not None
+        if self._has_smooth:
+            self.register_buffer(
+                "smooth_s",
+                rot.smooth_scale.to(device_t, dtype=output_dtype).contiguous(),
+                persistent=False,
+            )
+        else:
+            self.register_buffer(
+                "smooth_s",
+                torch.empty(0, device=device_t, dtype=output_dtype),
+                persistent=False,
+            )
+        if rot.act_clip is not None:
+            self.register_buffer(
+                "act_clip",
+                rot.act_clip.to(device_t, dtype=output_dtype).contiguous(),
+                persistent=False,
+            )
+        else:
+            self.register_buffer(
+                "act_clip",
+                torch.empty(0, device=device_t, dtype=output_dtype),
+                persistent=False,
+            )
         if rot.is_identity:
             self._has_perm = False
             self._rot_block_size = 0
@@ -217,6 +320,11 @@ class QuantLinear(nn.Module):
             self.act_scale_table = None  # type: ignore[assignment]
             self._has_scale_table = False
             self._num_steps = 1
+        if self.act_scale_mode != "dynamic" and not self._has_scale_table:
+            raise ValueError(
+                f"QuantLinear({self.name!r}): act_scale_mode="
+                f"{self.act_scale_mode!r} requires act_scale_table."
+            )
 
         # Python int counter — see step_context.py for the rationale on why
         # this is safe even under CUDA graph capture.
@@ -240,14 +348,15 @@ class QuantLinear(nn.Module):
             f"group_size={self.group_size}, scope={self.scope}, "
             f"act_scale_mode={self.act_scale_mode}, "
             f"act_scale_granularity={self.act_scale_granularity}, "
-            f"rotation_pipeline={','.join(self._rotation_pipeline) or 'none'}, "
+            f"pipeline={','.join(self._transform_pipeline) or 'none'}, "
             f"has_perm={self._has_perm}, "
+            f"has_smooth={self._has_smooth}, "
             f"has_residual={self._has_residual}"
         )
 
-    def _apply_rotation(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply the configured perm / SVD / Hadamard pipeline along the last axis."""
-        if not self._rotation_pipeline:
+    def _apply_transform(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the full pipeline (clip → smooth → rotation) along the last axis."""
+        if not self._transform_pipeline:
             return x
         u_blocks = (
             self.rotation_u_blocks
@@ -260,14 +369,19 @@ class QuantLinear(nn.Module):
             if self.random_hadamard_blocks.numel() > 0
             else None
         )
+        act_clip = self.act_clip if self.act_clip.numel() > 0 else None
+        if act_clip is not None and act_clip.ndim == 2:
+            act_clip = act_clip[self._step_counter % int(act_clip.shape[0])]
         return apply_input_pipeline(
             x,
-            pipeline=self._rotation_pipeline,
+            pipeline=self._transform_pipeline,
             u_blocks=u_blocks,
             perm=perm,
             block_size=self._rot_block_size,
             d=self.in_features,
             random_hadamard_blocks=random_hadamard_blocks,
+            act_clip=act_clip,
+            smooth_scale=self.smooth_s if self._has_smooth else None,
         )
 
     def _broadcast_per_token_scale(
@@ -307,9 +421,21 @@ class QuantLinear(nn.Module):
         the offline table: per-channel rows are ``(1, in_features)``;
         per-token rows are ``(num_tokens, 1)``.
         """
-        if self.act_scale_mode == "dynamic" or not self._has_scale_table:
+        if self.act_scale_mode == "dynamic":
+            if self.act_scale_granularity == "per_block":
+                blocks = x_rot.reshape(
+                    *x_rot.shape[:-1],
+                    self.in_features // self.group_size,
+                    self.group_size,
+                )
+                amax = blocks.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12)
+                grid_max = (
+                    FP4_E2M1_MAX if self._act_is_fp else float(self._act_qmax)
+                )
+                return (amax / grid_max).to(torch.float32)
             amax = x_rot.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12)
-            return (amax / self._act_qmax).to(torch.float32)
+            grid_max = FP4_E2M1_MAX if self._act_is_fp else float(self._act_qmax)
+            return (amax / grid_max).to(torch.float32)
 
         if self.act_scale_mode == "static":
             if self.act_scale_granularity == "per_token":
@@ -317,7 +443,6 @@ class QuantLinear(nn.Module):
             return self.act_scale_table.view(1, -1)
 
         step = self._step_counter % self._num_steps
-        self._step_counter += 1
         if self.act_scale_granularity == "per_token":
             return self._broadcast_per_token_scale(
                 self.act_scale_table[step], x_rot
@@ -327,42 +452,85 @@ class QuantLinear(nn.Module):
     def _quantize_activation(
         self, x_rot: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Symmetric int4 activation quant. Returns ``(x_dequant, _)`` for now.
+        """Quantize activations. Returns ``(x_dequant, scale)``.
 
-        We dequantize back to bf16 here rather than carrying int4 through the
-        GEMM, because the GEMM kernel is bf16. The int4 quant is still
-        *information-lossy* in the same way the int4 path would be, so the
-        end-to-end accuracy matches.
+        Supports signed symmetric int4 and E2M1 fp4 grids. We dequantize back
+        to bf16 here rather than carrying 4-bit codes through the GEMM, because
+        the GEMM kernel is bf16. The quant is still information-lossy in the
+        same way the native 4-bit path would be.
         """
         if self._act_no_quant:
             return x_rot, torch.ones(1, 1, device=x_rot.device, dtype=torch.float32)
+
+        if self._act_is_nvfp:
+            num_samples = self._flags.nvfp_activation_num_samples
+            assert num_samples is not None
+            x_dequant = nvfp4_quantize_activation(
+                x_rot,
+                group_size=self.group_size,
+                num_samples=num_samples,
+            ).to(self._flags.output_dtype)
+            return x_dequant, torch.ones(1, 1, device=x_rot.device, dtype=torch.float32)
+
         scale = self._activation_scale(x_rot)
-        # x_rot is at output_dtype (bf16). Promote to float32 for the round.
         x_fp32 = x_rot.to(torch.float32)
-        q = torch.round(x_fp32 / scale).clamp(self._act_qmin, self._act_qmax)
-        x_dequant = (q * scale).to(self._flags.output_dtype)
-        return x_dequant, scale
+        quant_shape = x_fp32.shape
+        if self.act_scale_granularity == "per_block":
+            x_fp32 = x_fp32.reshape(
+                *x_fp32.shape[:-1],
+                self.in_features // self.group_size,
+                self.group_size,
+            )
+        scaled = x_fp32 / scale
+
+        if self._act_is_fp:
+            _, q_vals = _fp4_e2m1_quantize(scaled)
+            x_dequant = (q_vals * scale).to(self._flags.output_dtype)
+        else:
+            q = torch.round(scaled).clamp(self._act_qmin, self._act_qmax)
+            x_dequant = (q * scale).to(self._flags.output_dtype)
+
+        return x_dequant.reshape(quant_shape), scale
 
     def _dequantize_weight(self) -> torch.Tensor:
-        """Bring the int4 weight back to ``output_dtype`` for the GEMM.
+        """Bring the quantized weight back to ``output_dtype`` for the GEMM.
 
-        We compute this on demand and cache it for the lifetime of one forward
-        pass. Trivially fast vs the GEMM itself but it'd be nice to fuse;
-        torch.compile happily does so when wrapped.
+        Supports int4 (signed symmetric), fp4 (E2M1 single-level), and
+        official NVFP4 (E2M1 + FP8 block + FP32 global). We compute this on
+        demand; torch.compile happily fuses dequant + GEMM when wrapped.
         """
         if self._weight_no_quant:
             return self.fp_weight
-        q = self.qweight  # int8 in [-8, 7], shape (N, K)
-        scale = self.weight_scale  # (N,) or (N, K/group_size) fp32
-        if scale.ndim == 1:
-            W_fp = q.to(torch.float32) * scale.unsqueeze(1)
+        q = self.qweight  # int8, shape (N, K)
+        scale = self.weight_scale  # (N,) or (N, K/group_size) or NVFP4 (1,)
+        N, K = q.shape
+
+        if self.weight_format == "nvfp":
+            if not self._has_weight_scale_2:
+                raise RuntimeError(
+                    f"QuantLinear({self.name}): weight_format=nvfp requires weight_scale_2."
+                )
+            W_fp = nvfp4_dequantize(
+                q, scale, self.weight_scale_2, group_size=self.group_size
+            )
+        elif self.weight_format == "fp":
+            vals = _fp4_e2m1_dequantize(q, device=q.device)
+            if scale.ndim == 1:
+                W_fp = vals * scale.unsqueeze(1)
+            else:
+                num_groups = scale.shape[1]
+                gs = K // num_groups
+                W_fp = (vals.reshape(N, num_groups, gs) * scale.unsqueeze(2)).reshape(N, K)
         else:
-            N, K = q.shape
-            num_groups = scale.shape[1]
-            gs = K // num_groups
-            W_fp = (
-                q.to(torch.float32).reshape(N, num_groups, gs) * scale.unsqueeze(2)
-            ).reshape(N, K)
+            if scale.ndim == 1:
+                W_fp = q.to(torch.float32) * scale.unsqueeze(1)
+            else:
+                num_groups = scale.shape[1]
+                gs = K // num_groups
+                W_fp = (
+                    q.to(torch.float32).reshape(N, num_groups, gs) * scale.unsqueeze(2)
+                ).reshape(N, K)
+
         return W_fp.to(self._flags.output_dtype)
 
     def _matmul_kernel(self, x: torch.Tensor) -> torch.Tensor:
@@ -381,11 +549,14 @@ class QuantLinear(nn.Module):
                 f"{self.in_features}, got {x.shape[-1]}."
             )
 
-        # 1. Rotation along input axis (block-diag).
-        x_rot = self._apply_rotation(x.to(self._flags.output_dtype))
+        # 1. Full input-side pipeline: clip → smooth → rotation.
+        x_cast = x.to(self._flags.output_dtype)
+        x_rot = self._apply_transform(x_cast)
 
         # 2. Activation quant -> dequant (lossy round to int4).
         x_q, _scale = self._quantize_activation(x_rot)
+        if self.act_clip.ndim == 2 or self.act_scale_mode == "per_step":
+            self._step_counter += 1
 
         # 3. Main GEMM.
         y = self._matmul_kernel(x_q)

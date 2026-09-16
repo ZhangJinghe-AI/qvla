@@ -5,12 +5,15 @@ End-to-end pipeline:
 1. Adapter builds the full-precision model (eager mode).
 2. We list every target Linear with :func:`wrap.list_target_modules`.
 3. Optional Fisher pass (``perm_score=fisher``).
-4. **Pipeline-wise rotation fit** — for each scope pipeline step that needs
-   activation stats, run a calibration pass on ``prefix_rotation.apply(x)``,
-   then fit that step; weight-only steps fit immediately from ``W``.
-5. **Final calibration pass** on the full ``rotation.apply(x)`` for GPTQ /
-   act-scale tables.
-6. Quantize rotated weights and serialize the :class:`Pack`.
+4. When adaptive act_clip is combined with a non-empty rotation pipeline,
+   fit per-channel ``act_clip`` in **original** space (no Hessian).
+5. **Pipeline-wise rotation fit** — for each scope pipeline step that needs
+   activation stats, run a calibration pass on ``clip(x)`` then
+   ``prefix_transform.apply(x)`` (clip omitted when unused), then fit that
+   step; weight-only steps fit immediately from ``W``.
+6. **Final calibration pass** on ``clip(x)`` then full ``rotation.apply(x)``
+   for GPTQ / act-scale tables.
+7. Quantize rotated weights and serialize the :class:`Pack`.
 """
 
 from __future__ import annotations
@@ -30,6 +33,8 @@ from qvla.build.collector import (
     AmaxCollectPlan,
     LayerStats,
     RotatedActivationCollector,
+    assert_dit_clip_has_per_step_table,
+    assert_smooth_pmean_step_coverage,
 )
 from qvla.build.utils import (
     choose_collector_device,
@@ -40,15 +45,17 @@ from qvla.config import QVLAConfig, ScopeConfig
 from qvla.core.pack import LayerPack, Pack
 from qvla.core.quantize import (
     QuantizedWeight,
+    FP4_E2M1_MAX,
     is_no_quant,
     percentile_amax,
     quantize_weight,
     symmetric_quant_range,
 )
-from qvla.core.rotation import (
-    PipelineRotationBuild,
-    Rotation,
-    identity_rotation,
+from qvla.core.pipeline import (
+    PipelineBuild,
+    Transform,
+    apply_input_pipeline,
+    identity_transform,
     step_needs_activation_calibration,
 )
 from qvla.runtime.wrap import list_target_modules
@@ -78,18 +85,27 @@ def _needs_offline_act_scale(scope_cfg: ScopeConfig) -> bool:
     return scope_cfg.act_scale_mode in ("static", "per_step")
 
 
+
 def _amax_collect_plan(scope_cfg: ScopeConfig) -> AmaxCollectPlan:
-    """Select which amax streams phase-2 must keep for this scope."""
-    if not _needs_offline_act_scale(scope_cfg):
-        return AmaxCollectPlan()
-    p = float(scope_cfg.act_percentile)
-    if scope_cfg.act_percentile_mode == "inner":
+    """Select which amax streams the final calibration must keep for this scope.
+
+    The final calibration pass collects Hessian and act-scale statistics in
+    the fully-transformed space.  Clip and smooth stats are NOT needed here
+    because they are always fitted during the pipeline-build phase via
+    ``PipelineBuild.fit_step``.
+    """
+    if _needs_offline_act_scale(scope_cfg):
+        p = float(scope_cfg.act_percentile)
+        if scope_cfg.act_percentile_mode == "inner":
+            if scope_cfg.act_scale_granularity == "per_token":
+                return AmaxCollectPlan(collect_inner_token=True, inner_percentile=p)
+            return AmaxCollectPlan(collect_inner_channel=True, inner_percentile=p)
         if scope_cfg.act_scale_granularity == "per_token":
-            return AmaxCollectPlan(collect_inner_token=True, inner_percentile=p)
-        return AmaxCollectPlan(collect_inner_channel=True, inner_percentile=p)
-    if scope_cfg.act_scale_granularity == "per_token":
-        return AmaxCollectPlan(collect_cross_token=True)
-    return AmaxCollectPlan(collect_cross_channel=True)
+            return AmaxCollectPlan(collect_cross_token=True)
+        return AmaxCollectPlan(collect_cross_channel=True)
+    return AmaxCollectPlan()
+
+
 
 
 def _act_scale_amax(
@@ -115,9 +131,10 @@ def _build_act_scale_table(
     if is_no_quant(scope_cfg.act_bits):
         return None
     _, act_qmax = symmetric_quant_range(scope_cfg.act_bits)
+    grid_max = FP4_E2M1_MAX if scope_cfg.act_format == "fp" else float(act_qmax)
     if scope_cfg.act_scale_mode == "static":
         amax = _act_scale_amax(stats, scope_cfg)
-        return (amax.clamp_min(1e-12) / act_qmax).to(torch.float32)
+        return (amax.clamp_min(1e-12) / grid_max).to(torch.float32)
     # per_step: step count lives on whichever stream the plan collected.
     if scope_cfg.act_scale_granularity == "per_token":
         step_buf = (
@@ -134,15 +151,38 @@ def _build_act_scale_table(
     rows = [
         _act_scale_amax(stats, scope_cfg, step=s) for s in range(step_buf.shape[0])
     ]
-    table = torch.stack(rows, dim=0).clamp_min(1e-12) / act_qmax
+    table = torch.stack(rows, dim=0).clamp_min(1e-12) / grid_max
     return table.to(torch.float32)
 
 
-def _rotate_weight(w: torch.Tensor, rotation: Rotation) -> torch.Tensor:
-    """Apply DuQuant input transform to ``W`` (matches runtime ``Rotation.apply``)."""
+def _rotate_weight(w: torch.Tensor, rotation: Transform) -> torch.Tensor:
+    """Apply the weight-side pipeline transform.
+
+    For orthogonal steps the transform is identical to the activation side.
+    Smooth is inverted (``W * s`` instead of ``x / s``) because
+    ``y = (x/s) @ (W*s)^T = x @ W^T``.  Clip is skipped (activation-only).
+    """
     if rotation.is_identity:
         return w.contiguous()
-    return rotation.apply(w.to(torch.float32)).contiguous()
+    out = w.to(torch.float32)
+    for step in rotation.pipeline:
+        if step == "clip":
+            continue
+        elif step == "smooth":
+            if rotation.smooth_scale is not None:
+                s = rotation.smooth_scale.to(device=out.device, dtype=out.dtype)
+                out = out * s.unsqueeze(0)
+        else:
+            out = apply_input_pipeline(
+                out,
+                pipeline=(step,),
+                u_blocks=rotation.u_blocks,
+                perm=rotation.perm,
+                block_size=rotation.block_size,
+                d=rotation.d,
+                random_hadamard_blocks=rotation.random_hadamard_blocks,
+            )
+    return out.contiguous()
 
 
 def _effective_noise_ensemble_k(
@@ -191,45 +231,51 @@ def _run_transformed_calibration(
     adapter: ModelAdapter,
     model: nn.Module,
     targets: list[tuple[str, str, nn.Module]],
-    transforms: dict[str, Rotation],
+    transforms: dict[str, Transform],
     *,
     config: QVLAConfig,
     num_samples: int,
-    quant_stats: bool,
     log_label: str,
     progress: Callable[[str, float], None] | None,
     progress_base: float,
     progress_span: float,
+    amax_plan_by_scope: dict[str, AmaxCollectPlan],
+    adaptive_token_scope: str | None = None,
 ) -> dict[str, LayerStats]:
     """Forward ``num_samples × K``; collect on ``transform.apply(x)``.
 
     ``K = noise_ensemble_k`` when ``targets`` include DiT layers, else ``K = 1``.
     LLM layer hooks are skipped for ``noise_index > 0`` because LLM activations
     are diffusion-noise-invariant; collecting once is enough.
+
+    When ``adaptive_token_scope`` is set, ``adapter.calibration_outlier_token_keep_mask``
+    is called per batch and fed to the collector for adaptive tip/rest splitting.
     """
+    if not amax_plan_by_scope:
+        raise ValueError("amax_plan_by_scope must be a non-empty dict.")
     k = _effective_noise_ensemble_k(targets, config)
     num_steps = {"llm": 1, "dit": config.dit.num_steps}
     dit_step_weights = _compute_dit_step_weights(
         config.calibration_step_aggregation, config.dit.num_steps
-    )
+    ) or {}
     total = num_samples * k
-    amax_plans = (
-        {
-            "llm": _amax_collect_plan(config.llm),
-            "dit": _amax_collect_plan(config.dit),
-        }
-        if quant_stats
-        else None
-    )
+    plan = next(iter(amax_plan_by_scope.values()))
     model_device = getattr(targets[0][2], "weight").device
-    collector_device = choose_collector_device(targets, model_device)
+    chunk_size = int(adapter.calibration_noise_spec().chunk_size)
+    collector_device = choose_collector_device(
+        targets, model_device,
+        amax_plan=plan,
+        num_samples=total,
+        model_kind=config.model_kind,
+        chunk_size=chunk_size,
+        num_steps_by_scope=num_steps,
+    )
     with RotatedActivationCollector(
         targets,
         transforms,
         num_steps_by_scope=num_steps,
         device=collector_device,
-        quant_stats=quant_stats,
-        amax_plan_by_scope=amax_plans,
+        amax_plan_by_scope=amax_plan_by_scope,
         noise_ensemble_k=k,
         dit_step_weights=dit_step_weights,
     ) as collector:
@@ -240,6 +286,14 @@ def _run_transformed_calibration(
         with torch.inference_mode():
             done = 0
             for i, batch in enumerate(adapter.iter_calibration_batches(num_samples)):
+                if (
+                    adaptive_token_scope is not None
+                    and adaptive_token_scope not in ("all", "skip_first")
+                ):
+                    mask = adapter.calibration_outlier_token_keep_mask(
+                        batch, token_scope=adaptive_token_scope,
+                    )
+                    collector.set_adaptive_token_keep_mask(mask)
                 for noise_index in range(k):
                     collector.set_noise_index(noise_index)
                     logger.info(
@@ -268,6 +322,7 @@ def _run_transformed_calibration(
     return {name: collector.stats[name] for name, _s, _m in targets}
 
 
+
 def _build_rotations_pipeline_wise(
     adapter: ModelAdapter,
     model: nn.Module,
@@ -276,13 +331,13 @@ def _build_rotations_pipeline_wise(
     num_samples: int,
     fisher_sensitivities: dict[str, torch.Tensor],
     progress: Callable[[str, float], None] | None,
-) -> dict[str, Rotation]:
-    """Fit each layer rotation by walking the scope pipeline step-by-step."""
+) -> dict[str, Transform]:
+    """Fit each layer transform by walking the scope pipeline step-by-step."""
     by_scope: dict[str, list[tuple[str, str, nn.Module]]] = defaultdict(list)
     for item in target_modules:
         by_scope[item[1]].append(item)
 
-    rotations: dict[str, Rotation] = {}
+    rotations: dict[str, Transform] = {}
     step_idx = 0
 
     for scope, scope_targets in by_scope.items():
@@ -291,16 +346,16 @@ def _build_rotations_pipeline_wise(
         if not pipeline:
             for name, _s, mod in scope_targets:
                 in_f = int(getattr(mod, "in_features"))
-                rotations[name] = identity_rotation(
+                rotations[name] = identity_transform(
                     in_f, scope_cfg.rotation_block_size
                 )
             continue
 
-        builders: dict[str, PipelineRotationBuild] = {}
+        builders: dict[str, PipelineBuild] = {}
         for name, _s, mod in scope_targets:
             w = getattr(mod, "weight").detach()
             in_f = int(w.shape[1])
-            builders[name] = PipelineRotationBuild(
+            builders[name] = PipelineBuild(
                 d=in_f,
                 block_size=scope_cfg.rotation_block_size,
                 weight=w,
@@ -310,6 +365,25 @@ def _build_rotations_pipeline_wise(
                 sensitivity=fisher_sensitivities.get(name),
                 layer_name=name,
                 build_seed=config.build_seed,
+                clip_epsilon=float(scope_cfg.smooth_epsilon),
+                clip_kappa=float(scope_cfg.act_outlier_kappa),
+                clip_bulk_percentile=float(scope_cfg.act_outlier_bulk_percentile),
+                clip_std_k=float(scope_cfg.act_outlier_std_k),
+                clip_std_k_down=float(scope_cfg.act_outlier_std_k_down),
+                clip_std_k_up=float(scope_cfg.act_outlier_std_k_up),
+                clip_selective_channels=bool(
+                    scope_cfg.act_outlier_selective_channels
+                ),
+                clip_global=bool(scope_cfg.act_outlier_global),
+                clip_skip_first_token=(
+                    scope_cfg.act_outlier_fit_tokens == "skip_first"
+                ),
+                smooth_alpha=float(scope_cfg.smooth_alpha),
+                smooth_epsilon=float(scope_cfg.smooth_epsilon),
+                smooth_act_percentile=float(scope_cfg.smooth_act_percentile),
+                smooth_fisher=fisher_sensitivities.get(name),
+                smooth_fisher_beta=float(scope_cfg.smooth_fisher_beta),
+                smooth_step_pmean_p=scope_cfg.smooth_step_pmean_p,
             )
 
         for step_index, step in enumerate(pipeline):
@@ -318,7 +392,11 @@ def _build_rotations_pipeline_wise(
                 perm_score=scope_cfg.perm_score,
                 svd_source=scope_cfg.svd_source,
             ):
-                prefix = {name: builders[name].prefix_rotation(step_index) for name, _, _ in scope_targets}
+                first_builder = next(iter(builders.values()))
+                amax_plan = first_builder.step_amax_plan(step_index)
+                prefix_transforms: dict[str, Transform] = {}
+                for name, _, _ in scope_targets:
+                    prefix_transforms[name] = builders[name].prefix_transform(step_index)
                 logger.info(
                     "Pipeline calibration (%s step %d/%d: %s on prefix %s) ...",
                     scope,
@@ -327,29 +405,45 @@ def _build_rotations_pipeline_wise(
                     step,
                     "+".join(pipeline[:step_index]) or "none",
                 )
+                token_scope = None
+                if step == "clip" and amax_plan.collect_adaptive_inner_channel:
+                    token_scope = scope_cfg.act_outlier_fit_tokens
                 stats = _run_transformed_calibration(
                     adapter,
                     model,
                     scope_targets,
-                    prefix,
+                    prefix_transforms,
                     config=config,
                     num_samples=num_samples,
-                    quant_stats=False,
                     log_label=f"{scope} pipeline-{step}",
                     progress=progress,
-                    progress_base=0.05 + 0.25 * step_idx / max(1, len(pipeline)),
-                    progress_span=0.25 / max(1, len(pipeline)),
+                    progress_base=0.35 + 0.20 * step_idx / max(1, len(pipeline)),
+                    progress_span=0.20 / max(1, len(pipeline)),
+                    amax_plan_by_scope={scope: amax_plan},
+                    adaptive_token_scope=token_scope,
                 )
+                if step == "smooth" and scope_cfg.smooth_step_pmean_p is not None:
+                    logger.info(
+                        "%s Smooth a_j: p-mean over denoise steps (p=%s).",
+                        scope,
+                        scope_cfg.smooth_step_pmean_p,
+                    )
+                    assert_smooth_pmean_step_coverage(stats)
                 step_idx += 1
                 for name, _, _ in scope_targets:
                     builders[name].fit_step(step_index, stats=stats[name])
-                # Each activation-calibration pass allocates one float32 X.T@X per
-                # target layer (~20 GiB for pi0.5 LLM, on GPU when it fits).
-                # Free before the next pass so ``stats = _run_transformed_calibration``
-                # does not briefly double peak memory (perm then svd both need stats).
-                # Also empty the CUDA caching allocator: otherwise ``mem_get_info``
-                # still shows the previous xtx as occupied and the next step falls
-                # back to CPU even though Python has released the tensors.
+                if step == "clip" and scope == "dit":
+                    clips = {
+                        name: builders[name].act_clip
+                        for name, _, _ in scope_targets
+                    }
+                    none_names = [n for n, c in clips.items() if c is None]
+                    if none_names:
+                        raise RuntimeError(
+                            "DiT clip fitted no act_clip for: "
+                            + ", ".join(none_names)
+                        )
+                    assert_dit_clip_has_per_step_table(clips)
                 del stats
                 gc.collect()
                 if torch.cuda.is_available():
@@ -364,16 +458,23 @@ def _build_rotations_pipeline_wise(
     return rotations
 
 
+
 def _make_layer_pack(
     name: str,
     scope: str,
     module: torch.nn.Module,
     quant_stats: LayerStats,
     scope_cfg: ScopeConfig,
-    rotation: Rotation,
-    fisher_sensitivity: torch.Tensor | None = None,
+    rotation: Transform,
+    fisher_rotated: torch.Tensor | None = None,
 ) -> LayerPack:
-    """Quantize one layer using stats on ``rotation.apply(x)``."""
+    """Quantize one layer.
+
+    ``act_clip`` and ``smooth_scale`` already live on ``rotation``
+    (fitted during the pipeline-build phase).  The Hessian and act scales
+    from the final calibration pass are already in the fully-transformed
+    space, so no additional smooth adjustment is needed here.
+    """
     w = getattr(module, "weight").detach()
     bias_attr = getattr(module, "bias", None)
     bias = bias_attr.detach().to(torch.float32) if bias_attr is not None else None
@@ -384,7 +485,8 @@ def _make_layer_pack(
     out_features = N
     device = w.device
 
-    W_rot = _rotate_weight(w.to(torch.float32), rotation)
+    W_fp = w.to(torch.float32)
+    W_rot = _rotate_weight(W_fp, rotation)
     H_rot = quant_stats.hessian().to(device)
 
     if scope_cfg.fisher_gptq:
@@ -393,14 +495,14 @@ def _make_layer_pack(
                 f"fisher_gptq=True requires weight_quantizer='gptq', "
                 f"got {scope_cfg.weight_quantizer!r} for layer {name!r}."
             )
-        if fisher_sensitivity is None:
+        if fisher_rotated is None:
             raise ValueError(
-                f"fisher_gptq=True but no Fisher sensitivity available "
-                f"for layer {name!r}."
+                f"fisher_gptq=True but no rotated-space Fisher sensitivity "
+                f"available for layer {name!r}."
             )
         from qvla.build.fisher import normalize_fisher_sensitivity
 
-        F_norm = normalize_fisher_sensitivity(fisher_sensitivity.to(device))
+        F_norm = normalize_fisher_sensitivity(fisher_rotated.to(device))
         d_sqrt = F_norm.sqrt()
         H_rot = H_rot * d_sqrt.unsqueeze(1) * d_sqrt.unsqueeze(0)
         logger.info(
@@ -419,6 +521,7 @@ def _make_layer_pack(
         scope_cfg.weight_quantizer,
         group_size=scope_cfg.group_size,
         weight_bits=scope_cfg.weight_bits,
+        weight_format=scope_cfg.weight_format,
         hessian=H_rot,
         gptq_block_size=scope_cfg.gptq_block_size,
         gptq_damp_percent=scope_cfg.gptq_damp_percent,
@@ -442,8 +545,11 @@ def _make_layer_pack(
         weight_scale=qw.weight_scale,
         group_size=qw.group_size,
         weight_bits=qw.weight_bits,
+        weight_format=qw.weight_format,
+        weight_scale_2=qw.weight_scale_2,
         rotation=rotation,
         act_bits=scope_cfg.act_bits,
+        act_format=scope_cfg.act_format,
         act_scale_mode=scope_cfg.act_scale_mode,
         act_scale_granularity=scope_cfg.act_scale_granularity,
         act_scale_table=act_scale_table,
@@ -483,7 +589,7 @@ def _configure_adapter_for_fisher(adapter: ModelAdapter, config: QVLAConfig) -> 
     if cfg is None or not hasattr(cfg, "max_batch_size"):
         raise RuntimeError(
             f"fisher_batch_size={config.fisher_batch_size} requires an adapter "
-            "with cfg.max_batch_size (pi05); got "
+            "with cfg.max_batch_size; got "
             f"{type(adapter).__name__}."
         )
     if adapter.engine is not None:
@@ -527,7 +633,7 @@ def build_pack(
     if not target_modules:
         raise RuntimeError(
             "Configured regex matched zero linear modules. Run "
-            "`python scripts/build_pi05_pack.py debug-regex --checkpoint <path>` "
+            "`python scripts/build_pack.py debug-regex --model <model> --checkpoint <path>` "
             "to see what your model exposes."
         )
     logger.info(
@@ -581,6 +687,7 @@ def build_pack(
             noise_ensemble_k=config.noise_ensemble_k,
             action_timestep=config.fisher_action_timestep,
             batch_size=config.fisher_batch_size,
+            fisher_type=config.fisher_type,
             method=config.fisher_method,
             hutchinson_probes=config.fisher_hutchinson_probes,
             progress=progress,
@@ -631,6 +738,7 @@ def build_pack(
             noise_ensemble_k=config.noise_ensemble_k,
             action_timestep=config.fisher_action_timestep,
             batch_size=config.fisher_batch_size,
+            fisher_type=config.fisher_type,
             method=config.fisher_method,
             hutchinson_probes=config.fisher_hutchinson_probes,
             rotations=gptq_rots,
@@ -644,7 +752,9 @@ def build_pack(
     if progress:
         progress("calibrate", 0.55)
     log_memory("build_pack: before final calibration")
-    logger.info("Final calibration pass on full pipeline (Hessian + act scales) ...")
+    logger.info(
+        "Final calibration pass on full pipeline (Hessian + act scales) ..."
+    )
     quant_stats = _run_transformed_calibration(
         adapter,
         model,
@@ -652,11 +762,14 @@ def build_pack(
         rotations,
         config=config,
         num_samples=num_samples,
-        quant_stats=True,
         log_label="quant",
         progress=progress,
         progress_base=0.55,
         progress_span=0.20,
+        amax_plan_by_scope={
+            "llm": _amax_collect_plan(config.llm),
+            "dit": _amax_collect_plan(config.dit),
+        },
     )
 
     layer_packs: dict[str, LayerPack] = {}
@@ -670,7 +783,7 @@ def build_pack(
                 quant_stats[name],
                 scope_cfg,
                 rotations[name],
-                fisher_sensitivity=fisher_gptq_sensitivities.get(name),
+                fisher_rotated=fisher_gptq_sensitivities.get(name),
             )
         except Exception as e:
             if not config.skip_incompatible:

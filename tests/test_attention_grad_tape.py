@@ -11,7 +11,7 @@ _PKG_SRC = Path(__file__).resolve().parent.parent / "src"
 if str(_PKG_SRC) not in sys.path:
     sys.path.insert(0, str(_PKG_SRC))
 
-from qvla.build.attention_grad import (  # noqa: E402
+from qvla.adapters.pi05.attention_grad import (  # noqa: E402
     _gather_joint_kv_padded,
     _gather_joint_kv_segment,
     _padded_kv_layout,

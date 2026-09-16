@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager
 from dataclasses import replace
 
 import numpy as np
@@ -79,6 +80,47 @@ class PI05Adapter(ModelAdapter):
             self.cfg, num_samples, state_dim=self.cfg.state_dim
         )
 
+    def calibration_outlier_token_keep_mask(
+        self,
+        batch: dict,
+        *,
+        token_scope: str,
+    ) -> torch.Tensor:
+        """Keep image (and optionally lang_pad) tokens for adaptive tip-clip fit."""
+        if token_scope not in ("all", "image", "image_lang_pad"):
+            raise ValueError(
+                "token_scope must be 'all', 'image' or 'image_lang_pad', "
+                f"got {token_scope!r}."
+            )
+        self._ensure_processor()
+        assert self._engine is not None
+        sched = self._engine.entry.scheduler
+        n_img = int(sched.image_token_count)
+        request = build_pi05_request(
+            self._processor, batch, state_dim=self.cfg.state_dim
+        )
+        if int(request.lang_lens.numel()) != 1:
+            raise RuntimeError(
+                "adaptive outlier token mask expects batch size 1, got "
+                f"lang_lens shape {tuple(request.lang_lens.shape)}."
+            )
+        lang_len = int(request.lang_lens[0].item())
+        n_ps = int(sched._bucket_n_per_sample(lang_len))
+        if n_ps < n_img:
+            raise RuntimeError(f"n_per_sample={n_ps} < n_img={n_img}.")
+        if lang_len < 0 or lang_len > n_ps - n_img:
+            raise RuntimeError(
+                f"lang_len={lang_len} incompatible with n_img={n_img}, "
+                f"n_per_sample={n_ps}."
+            )
+        if token_scope == "all":
+            return torch.ones(n_ps, dtype=torch.bool)
+        keep = torch.zeros(n_ps, dtype=torch.bool)
+        keep[:n_img] = True
+        if token_scope == "image_lang_pad":
+            keep[n_img + lang_len : n_ps] = True
+        return keep
+
     def forward_for_calibration(
         self,
         model: nn.Module,
@@ -111,8 +153,11 @@ class PI05Adapter(ModelAdapter):
         sample_indices: list[int] | None = None,
         noise_index: int = 0,
     ) -> torch.Tensor:
+        from qvla.adapters.pi05.differentiable_forward import (
+            differentiable_step,
+            reset_differentiable_state,
+        )
         from qvla.build.calibration_noise import calibration_noise_for_sample_if_enabled
-        from qvla.build.differentiable_forward import differentiable_step
         from qvla.runtime.step_context import reset_step_counters
 
         self._ensure_processor()
@@ -141,6 +186,7 @@ class PI05Adapter(ModelAdapter):
                 "(pack build sets this from fisher_batch_size)."
             )
 
+        reset_differentiable_state(sched)
         reset_step_counters(self._engine.entry.model)
         request = build_pi05_request(
             self._processor, obs_list, state_dim=self.cfg.state_dim
@@ -162,6 +208,21 @@ class PI05Adapter(ModelAdapter):
             request = replace(request, noise=torch.cat(noises, dim=0))
         return differentiable_step(sched, request)
 
+    @contextmanager
+    def fisher_forward_context(self, set_step):
+        from qvla.adapters.pi05.differentiable_forward import (
+            differentiable_inference_context,
+            force_eager_runners,
+        )
+
+        if self._engine is None:
+            raise RuntimeError("fisher_forward_context() requires build_model() first.")
+        sched = self._engine.entry.scheduler
+        force_eager_runners(sched)
+        with differentiable_inference_context(sched):
+            with patched_one_step(find_expert_runner(self._engine), set_step):
+                yield
+
     @property
     def engine(self):
         return self._engine
@@ -171,6 +232,20 @@ class PI05Adapter(ModelAdapter):
         if self._engine is None:
             return None
         return self._engine.entry.model
+
+    def calibration_noise_spec(self):
+        from qvla.build.calibration_noise import CalibrationNoiseSpec
+
+        if self._engine is None:
+            raise RuntimeError("calibration_noise_spec() requires build_model() first.")
+        sched = self._engine.entry.scheduler
+        cfg = sched.cfg
+        return CalibrationNoiseSpec(
+            chunk_size=int(cfg.chunk_size),
+            action_dim=int(cfg.max_action_dim),
+            device=torch.device(sched.device),
+            dtype=sched.params_dtype,
+        )
 
     def dit_step_count(self, config: QVLAConfig) -> int:
         if self._engine is None:

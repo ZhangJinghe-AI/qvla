@@ -17,12 +17,12 @@ Everything else is internal. Importing this top-level module is side-effect free
 from __future__ import annotations
 
 from qvla.build import build_pack, compute_fisher_sensitivity
-from qvla.build.fisher import FisherCollector
+from qvla.build.fisher import InputGradFisherCollector
 from qvla.config import QVLAConfig
 from qvla.runtime import QuantLinear, enable_quantization
 
 __all__ = [
-    "FisherCollector",
+    "InputGradFisherCollector",
     "QVLAConfig",
     "QuantLinear",
     "build_pack",

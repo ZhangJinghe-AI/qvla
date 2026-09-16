@@ -36,22 +36,27 @@ src/qvla/
     step_context.py      # per-layer step counter (CUDA-graph friendly)
     wrap.py              # walk-and-replace via regex include/exclude
 
-  build/                 # offline pack builder
+  build/                 # model-agnostic offline pack builder
     builder.py           # rotation -> GPTQ/RTN -> per-step scales
     collector.py         # activation-capture hooks during calibration
     fisher.py            # Fisher sensitivity (policy-aware DiT rotation)
-    differentiable_forward.py
-    attention_grad.py
+    calibration_noise.py # fixed per-sample / global calibration noise
+    grad_patches.py      # shared autograd patches for phyai layers (Fisher)
 
-  adapters/              # per-model glue (regexes, calibration loop)
+  adapters/              # per-model glue (regexes, calibration loop, autograd)
     base.py
-    pi05.py
-    groot.py
+    pi05/
+      adapter.py
+      differentiable_forward.py  # pi0.5 autograd path (Fisher)
+      attention_grad.py          # pi0.5 paged-KV attention for grad
+    groot/
+      adapter.py
+      differentiable.py          # GR00T autograd context (Fisher)
 
   calibration/           # optional calibration-data providers
     file.py
 
-scripts/build_pi05_pack.py
+scripts/build_pack.py       # unified CLI (--model pi05|groot)
 tests/
 ```
 
@@ -60,7 +65,8 @@ tests/
 ### 1. Build the pack (offline, one-time per checkpoint)
 
 ```bash
-uv run python scripts/build_pi05_pack.py \
+uv run python scripts/build_pack.py \
+    --model pi05 \
     --checkpoint /data/share/pi05-libero \
     --output ./packs/pi05_libero_object_W4A4.pt \
     --calibration-source file \
@@ -74,7 +80,8 @@ The builder runs a Fisher sensitivity pass (``--fisher-num-samples``, default 4)
 before quantizing DiT layers; expect ~10 min per Fisher sample on pi0.5-libero.
 
 ```bash
-uv run python scripts/build_pi05_pack.py \
+uv run python scripts/build_pack.py \
+    --model pi05 \
     --checkpoint /data/share/pi05-libero \
     --output ./packs/pi05_libero_policy_W4A4.pt \
     --calibration-source file \
@@ -86,7 +93,7 @@ uv run python scripts/build_pi05_pack.py \
 
 Run ``--help`` to override every field on ``QVLAConfig`` / ``ScopeConfig``
 (per-scope rotation, zigzag perm, SVD source, activation scales, GPTQ knobs,
-regexes, etc.). ``--config-json`` loads a base recipe; explicit flags win.
+regexes, etc.).
 
 DuQuant rotation knobs (per scope):
 

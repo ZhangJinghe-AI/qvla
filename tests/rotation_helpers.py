@@ -7,12 +7,12 @@ import logging
 import torch
 
 from qvla.build.collector import LayerStats
-from qvla.core.rotation import (
+from qvla.core.pipeline import (
     PermScore,
-    PipelineRotationBuild,
+    PipelineBuild,
     PipelineStep,
     SvdSource,
-    identity_rotation,
+    identity_transform,
     step_needs_activation_calibration,
     validate_pipeline,
 )
@@ -47,7 +47,7 @@ def fit_rotation(
         if sensitivity is not None:
             sensitivity = sensitivity.to(device)
 
-    builder = PipelineRotationBuild(
+    builder = PipelineBuild(
         d=d,
         block_size=block_size,
         weight=weight,
@@ -83,4 +83,4 @@ def fit_rotation(
             block_size,
             e,
         )
-        return identity_rotation(d, block_size)
+        return identity_transform(d, block_size)

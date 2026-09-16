@@ -33,7 +33,7 @@ from qvla.core.pack import LayerPack, Pack
 from qvla.runtime import QuantLinear
 from qvla.core.quantize import (
     QuantizedWeight, dequantize, gptq_quantize, is_no_quant, no_quantize,
-    quantize_weight, rtn_quantize,
+    nvfp4_quantize_activation, quantize_weight, rtn_quantize,
     rtn_residual_quantize, symmetric_quant_range,
 )
 from qvla.build.collector import (
@@ -41,7 +41,7 @@ from qvla.build.collector import (
     LayerStats,
     RotatedActivationCollector,
 )
-from qvla.core.rotation import identity_rotation
+from qvla.core.pipeline import Transform, identity_transform
 from rotation_helpers import fit_rotation
 from qvla.runtime import (
     classify, enable_quantization, list_target_modules,
@@ -52,7 +52,7 @@ torch.manual_seed(0)
 
 
 # --------------------------------------------------------------------------- #
-# Rotation                                                                    #
+# Transform                                                                   #
 # --------------------------------------------------------------------------- #
 
 
@@ -66,14 +66,14 @@ def test_hadamard_orthonormal():
         assert torch.allclose(R @ R.T, torch.eye(n), atol=1e-5)
 
 
-def test_identity_rotation_is_noop():
-    rot = identity_rotation(d=128, block_size=64)
+def test_identity_transform_is_noop():
+    rot = identity_transform(d=128, block_size=64)
     x = torch.randn(3, 128)
     out = rot.apply(x)
     assert torch.equal(out, x)
 
 
-def test_hadamard_rotation_invertible():
+def test_hadamard_transform_invertible():
     rot = fit_rotation(
         d=128, block_size=64, weight=torch.randn(1, 128), pipeline=("hadamard",)
     )
@@ -190,7 +190,7 @@ def test_rotated_activation_hessian_matches_congruence():
 
 
 def test_activation_svd_after_perm_matches_direct_u_fit():
-    """Pipeline-wise SVD on perm(x) cov must match _fit_u_blocks on the same cov."""
+    """Pipeline-wise SVD on perm(x) cov must match fit_u_blocks on the same cov."""
     torch.manual_seed(3)
     d, block_size, n = 64, 16, 32
     W = torch.randn(n, d) * 0.05
@@ -198,13 +198,10 @@ def test_activation_svd_after_perm_matches_direct_u_fit():
     amax = X.abs().amax(dim=0)
 
     from qvla.build.collector import LayerStats
-    from qvla.core.rotation import (
-        PipelineRotationBuild,
-        Rotation,
-        _fit_u_blocks,
-    )
+    from qvla.core.pipeline import PipelineBuild, Transform
+    from qvla.core.rotation import fit_u_blocks
 
-    builder = PipelineRotationBuild(
+    builder = PipelineBuild(
         d=d,
         block_size=block_size,
         weight=W,
@@ -225,7 +222,7 @@ def test_activation_svd_after_perm_matches_direct_u_fit():
     builder.fit_step(1, stats=svd_stats)
     rot_new = builder.finish()
 
-    u_ref = _fit_u_blocks(
+    u_ref = fit_u_blocks(
         d=d,
         block_size=block_size,
         weight=W,
@@ -235,7 +232,7 @@ def test_activation_svd_after_perm_matches_direct_u_fit():
         sensitivity=None,
         eps=1e-6,
     )
-    rot_ref = Rotation(
+    rot_ref = Transform(
         mode="perm+svd+hadamard",
         block_size=block_size,
         d=d,
@@ -323,7 +320,7 @@ def test_no_quant_layer_forward_matches_fp_linear(tmp_path):
         weight_scale=qw.weight_scale,
         group_size=qw.group_size,
         weight_bits=qw.weight_bits,
-        rotation=identity_rotation(K, 64),
+        rotation=identity_transform(K, 64),
         act_bits=16,
         act_scale_mode="dynamic",
         act_scale_table=None,
@@ -355,7 +352,7 @@ def test_pack_save_load_roundtrip(tmp_path):
     K, N = 128, 64
     W = torch.randn(N, K) * 0.05
     qw = rtn_quantize(W, group_size=64)
-    rot = identity_rotation(K, 64)
+    rot = identity_transform(K, 64)
     layer = LayerPack(
         name="foo.bar.qkv_proj",
         scope="dit",
@@ -446,7 +443,7 @@ def _fake_pack_for_module(model, cfg) -> Pack:
             in_features=K, out_features=N, bias_present=False,
             qweight=qw.qweight, weight_scale=qw.weight_scale,
             group_size=qw.group_size, weight_bits=qw.weight_bits,
-            rotation=identity_rotation(K, 64),
+            rotation=identity_transform(K, 64),
             act_bits=4, act_scale_mode="dynamic",
             act_scale_table=None,
             bias=None, residual=None,
@@ -504,13 +501,13 @@ def test_act_channel_inner_amax_is_inner_not_cross():
         dtype=torch.float32,
     )
     stats = LayerStats(in_features=2)
-    stats.init_phase2(
+    stats.init(
         2,
         1,
         "cpu",
         amax_plan=AmaxCollectPlan(collect_inner_channel=True, inner_percentile=99.9),
     )
-    stats.update_phase2(x, step=None)
+    stats.update(x, step=None)
 
     per_ch = stats.act_channel_inner_amax()
     expected = channel_percentile_amax(x.abs(), 99.9)
@@ -559,6 +556,71 @@ def test_rotated_act_scale_collector_matches_rotation_apply():
     assert torch.allclose(collected, manual, rtol=1e-5, atol=1e-5)
 
 
+def test_dit_prefix_step_none_repeats_amax_across_steps():
+    """Cached K/V is reused every denoise step, so prefix amax fills all rows."""
+    from qvla.build.collector import LayerStats
+
+    x_prefix = torch.tensor([[1.0, 4.0], [2.0, 3.0]], dtype=torch.float32)
+    stats = LayerStats(in_features=2)
+    stats.init(
+        2,
+        4,
+        "cpu",
+        amax_plan=AmaxCollectPlan(collect_cross_channel=True),
+    )
+    stats.update(x_prefix, step=None)
+    expected = torch.tensor([2.0, 4.0])
+    assert torch.allclose(stats.static_cross_channel_amax, expected)
+    assert torch.equal(
+        stats.per_step_cross_channel_amax,
+        expected.unsqueeze(0).expand(4, -1),
+    )
+    assert not bool(stats.per_step_seen.any().item())
+
+
+def test_rotated_collector_applies_clip_in_pipeline():
+    """clip step in transform.apply() must clamp before rotation."""
+    K = 32
+    lin = nn.Linear(K, 8, bias=False)
+    x = torch.randn(4, K) * 10.0
+    rot = fit_rotation(
+        d=K,
+        block_size=32,
+        weight=lin.weight.detach(),
+        pipeline=("clip", "hadamard"),
+        device="cpu",
+    )
+    clip = torch.full((K,), 0.5)
+    manual = rot.apply(x.clamp(min=-clip, max=clip)).abs().amax(dim=0)
+    transform = Transform(
+        mode=rot.mode,
+        block_size=rot.block_size,
+        d=rot.d,
+        u_blocks=rot.u_blocks,
+        perm=rot.perm,
+        random_hadamard_blocks=rot.random_hadamard_blocks,
+        act_clip=clip,
+        pipeline=rot.pipeline,
+    )
+
+    with RotatedActivationCollector(
+        [("layer", "llm", lin)],
+        {"layer": transform},
+        num_steps_by_scope={"llm": 1},
+        device="cpu",
+        amax_plan_by_scope={
+            "llm": AmaxCollectPlan(collect_cross_channel=True),
+        },
+    ) as col:
+        lin(x)
+
+    collected = col.stats["layer"].act_channel_cross_amax()
+    assert torch.allclose(collected, manual, rtol=1e-5, atol=1e-5)
+    unclipped = rot.apply(x).abs().amax(dim=0)
+    assert not torch.allclose(collected, unclipped, rtol=1e-3, atol=1e-3)
+
+
+
 # --------------------------------------------------------------------------- #
 # Step counter                                                                #
 # --------------------------------------------------------------------------- #
@@ -575,7 +637,7 @@ def test_per_step_counter_advances():
         in_features=K, out_features=N, bias_present=False,
         qweight=qw.qweight, weight_scale=qw.weight_scale,
         group_size=qw.group_size, weight_bits=qw.weight_bits,
-        rotation=identity_rotation(K, 64),
+        rotation=identity_transform(K, 64),
         act_bits=4, act_scale_mode="per_step",
         act_scale_table=table, bias=None, residual=None,
     )
@@ -607,7 +669,7 @@ def test_static_per_token_uses_offline_table():
         weight_scale=qw.weight_scale,
         group_size=qw.group_size,
         weight_bits=qw.weight_bits,
-        rotation=identity_rotation(K, 64),
+        rotation=identity_transform(K, 64),
         act_bits=4,
         act_scale_mode="static",
         act_scale_granularity="per_token",
@@ -644,7 +706,7 @@ def test_per_token_scales_tile_across_batch():
         weight_scale=qw.weight_scale,
         group_size=qw.group_size,
         weight_bits=qw.weight_bits,
-        rotation=identity_rotation(K, 64),
+        rotation=identity_transform(K, 64),
         act_bits=4,
         act_scale_mode="per_step",
         act_scale_granularity="per_token",
@@ -664,3 +726,211 @@ def test_per_token_scales_tile_across_batch():
     assert scale.shape == (batch * chunk, 1)
     assert torch.allclose(scale, table[0].repeat(batch).view(-1, 1))
     _ = layer(x)  # full forward must not raise
+
+
+# --------------------------------------------------------------------------- #
+# NVFP4 activation (dynamic only)                                             #
+# --------------------------------------------------------------------------- #
+
+
+def test_nvfp_dynamic_act_forward():
+    K, N = 64, 32
+    W = torch.randn(N, K) * 0.05
+    qw = rtn_quantize(W, group_size=16, weight_format="nvfp")
+    layer_pack = LayerPack(
+        name="llm.layer",
+        scope="llm",
+        in_features=K,
+        out_features=N,
+        bias_present=False,
+        qweight=qw.qweight,
+        weight_scale=qw.weight_scale,
+        group_size=qw.group_size,
+        weight_bits=qw.weight_bits,
+        weight_format="nvfp",
+        weight_scale_2=qw.weight_scale_2,
+        rotation=identity_transform(K, 64),
+        act_bits=4,
+        act_format="nvfp",
+        act_scale_mode="dynamic",
+        act_scale_granularity="per_block",
+        act_scale_table=None,
+        bias=None,
+        residual=None,
+    )
+    with pytest.raises(ValueError, match="explicit positive"):
+        QuantLinear(
+            layer_pack,
+            return_tuple=False,
+            skip_bias_add=False,
+            output_dtype=torch.float32,
+            device="cpu",
+        )
+    layer = QuantLinear(
+        layer_pack,
+        return_tuple=False,
+        skip_bias_add=False,
+        output_dtype=torch.float32,
+        device="cpu",
+        nvfp_activation_num_samples=4,
+    )
+    y = layer(torch.randn(4, K))
+    assert y.shape == (4, N)
+
+
+def test_nvfp_dynamic_act_is_independent_across_samples():
+    torch.manual_seed(0)
+    fixed = torch.randn(3, 32)
+    peer_a = torch.randn(3, 32)
+    peer_b = torch.randn(3, 32) * 100
+
+    out_a = nvfp4_quantize_activation(
+        torch.cat((fixed, peer_a)), group_size=16, num_samples=2
+    )[:3]
+    out_b = nvfp4_quantize_activation(
+        torch.cat((fixed, peer_b)), group_size=16, num_samples=2
+    )[:3]
+
+    assert torch.equal(out_a, out_b)
+
+
+def test_nvfp_dynamic_act_rejects_ambiguous_sample_boundaries():
+    with pytest.raises(ValueError, match="divide evenly"):
+        nvfp4_quantize_activation(
+            torch.randn(5, 32), group_size=16, num_samples=2
+        )
+
+
+def test_nvfp_act_rejects_static():
+    with pytest.raises(ValueError, match="dynamic"):
+        ScopeConfig(
+            group_size=16,
+            act_format="nvfp",
+            act_bits=4,
+            act_scale_mode="static",
+            act_scale_granularity="per_block",
+        )
+
+
+def test_nvfp_requires_per_block():
+    with pytest.raises(ValueError, match="per_block"):
+        ScopeConfig(
+            group_size=16,
+            act_format="nvfp",
+            act_bits=4,
+            act_scale_mode="dynamic",
+            act_scale_granularity="per_token",
+        )
+
+
+def test_dynamic_int_per_block_config():
+    cfg = ScopeConfig(
+        group_size=16,
+        act_format="int",
+        act_scale_mode="dynamic",
+        act_scale_granularity="per_block",
+    )
+    assert cfg.act_scale_granularity == "per_block"
+    fp_cfg = ScopeConfig(
+        group_size=16,
+        act_format="fp",
+        act_scale_mode="dynamic",
+        act_scale_granularity="per_block",
+    )
+    assert fp_cfg.act_scale_granularity == "per_block"
+    with pytest.raises(ValueError, match="dynamic"):
+        ScopeConfig(
+            group_size=16,
+            act_format="int",
+            act_scale_mode="static",
+            act_scale_granularity="per_block",
+        )
+
+
+def test_nvfp_requires_group_size_16():
+    with pytest.raises(ValueError, match="group_size=16"):
+        ScopeConfig(
+            act_format="nvfp",
+            act_bits=4,
+            act_scale_mode="dynamic",
+            act_scale_granularity="per_block",
+        )
+    cfg = ScopeConfig(
+        group_size=16,
+        weight_format="nvfp",
+        act_format="nvfp",
+        act_bits=4,
+        act_scale_mode="dynamic",
+        act_scale_granularity="per_block",
+    )
+    assert cfg.group_size == 16
+    W = torch.randn(8, 32)
+    with pytest.raises(ValueError, match="group_size=16"):
+        rtn_quantize(W, group_size=32, weight_format="nvfp")
+    with pytest.raises(ValueError, match="group_size=16"):
+        gptq_quantize(
+            W,
+            torch.eye(32),
+            group_size=32,
+            weight_format="nvfp",
+        )
+
+
+def test_dynamic_int_per_block_quantizes_each_block_independently():
+    K, N, group_size = 32, 8, 16
+    W = torch.randn(N, K) * 0.05
+    qw = rtn_quantize(W, group_size=group_size)
+    layer_pack = LayerPack(
+        name="llm.layer",
+        scope="llm",
+        in_features=K,
+        out_features=N,
+        bias_present=False,
+        qweight=qw.qweight,
+        weight_scale=qw.weight_scale,
+        group_size=group_size,
+        weight_bits=4,
+        rotation=identity_transform(K, 16),
+        act_bits=4,
+        act_format="int",
+        act_scale_mode="dynamic",
+        act_scale_granularity="per_block",
+        act_scale_table=None,
+        bias=None,
+        residual=None,
+    )
+    layer = QuantLinear(
+        layer_pack,
+        return_tuple=False,
+        skip_bias_add=False,
+        output_dtype=torch.float32,
+        device="cpu",
+    )
+    x = torch.cat((torch.linspace(-1, 1, 16), torch.linspace(-100, 100, 16))).view(1, K)
+    actual, scales = layer._quantize_activation(x)
+    blocks = x.reshape(1, 2, group_size)
+    expected_scales = blocks.abs().amax(dim=-1, keepdim=True) / 7.0
+    expected = (
+        torch.round(blocks / expected_scales).clamp(-8, 7) * expected_scales
+    ).reshape_as(x)
+    assert scales.shape == (1, 2, 1)
+    assert torch.allclose(actual, expected)
+
+
+def test_llm_act_scale_mode_must_be_dynamic():
+    with pytest.raises(ValueError, match="LLM act_scale_mode"):
+        QVLAConfig(
+            llm=ScopeConfig(act_scale_mode="static"),
+            dit=ScopeConfig(num_steps=10),
+        )
+    with pytest.raises(ValueError, match="LLM act_scale_mode"):
+        QVLAConfig(
+            llm=ScopeConfig(act_scale_mode="per_step", num_steps=10),
+            dit=ScopeConfig(num_steps=10),
+        )
+    # DiT may still use static / per_step.
+    cfg = QVLAConfig(
+        llm=ScopeConfig(act_scale_mode="dynamic"),
+        dit=ScopeConfig(act_scale_mode="per_step", num_steps=10),
+    )
+    assert cfg.dit.act_scale_mode == "per_step"

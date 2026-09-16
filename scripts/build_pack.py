@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Build and debug pi0.5 QVLA W4A4 packs.
+"""Build and debug QVLA W4A4 packs for any supported model.
 
 Subcommands::
 
@@ -8,29 +8,36 @@ Subcommands::
 
 Examples::
 
-    # Standard W4A4 pack
-    uv run python scripts/build_pi05_pack.py \\
+    # pi0.5
+    uv run python scripts/build_pack.py \\
+        --model pi05 \\
         --checkpoint /data/share/pi05-libero \\
         --output ./packs/pi05_libero_W4A4.pt \\
         --calibration-source file \\
         --calibration-data ../calibration_data/libero_object_16_7.npz \\
         -vv
 
-    # Fisher-driven perm on DiT (runs a Fisher pass during the build)
-    uv run python scripts/build_pi05_pack.py \\
+    # GR00T-N1.7
+    uv run python scripts/build_pack.py \\
+        --model groot_n17 \\
+        --checkpoint /data/share/gr00t-n17-libero \\
+        --embodiment-tag LIBERO_PANDA \\
+        --processor-model-name-or-path /data/share/Cosmos-Reason2-2B \\
+        --calibration-source synthetic \\
+        -vv
+
+    # Fisher-driven perm on DiT (opt into rotation pipeline)
+    uv run python scripts/build_pack.py \\
+        --model pi05 \\
         --checkpoint /data/share/pi05-libero \\
-        --output ./packs/pi05_libero_policy_W4A4.pt \\
-        --calibration-source file \\
-        --calibration-data ../calibration_data/libero_object_16_7.npz \\
         --dit-pipeline perm,svd,hadamard \\
         --dit-perm-score fisher \\
         --fisher-num-samples 4 \\
         --fisher-batch-size 4 \\
-        --fisher-step-aggregation uniform \\
-        --calibration-step-aggregation uniform \\
         -vv
 
-    uv run python scripts/build_pi05_pack.py debug-regex \\
+    uv run python scripts/build_pack.py debug-regex \\
+        --model pi05 \\
         --checkpoint /data/share/pi05-libero
 """
 
@@ -41,52 +48,54 @@ import logging
 import sys
 from dataclasses import replace
 from pathlib import Path
-from typing import Sequence
+from typing import Sequence, get_args
 
 # Allow running from a fresh checkout without `pip install -e .`.
 _ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT / "src"))
 
 from qvla.adapters import get_adapter  # noqa: E402
+from qvla.adapters.groot.config import DEFAULT_PROCESSOR_MODEL_NAME_OR_PATH  # noqa: E402
 from qvla.build import build_pack  # noqa: E402
 from qvla.config import (  # noqa: E402
+    ActOutlierFitTokens,
     ActPercentileMode,
     ActScaleGranularity,
     ActScaleMode,
-    DEFAULT_PIPELINE,
-    QVLAConfig,
+    CalibrationStepAggregation,
+    FisherMethod,
+    FisherType,
     PermScore,
+    QVLAConfig,
+    StepAggregation,
     SvdSource,
+    QuantFormat,
     WeightQuantizer,
 )
-from qvla.core.rotation import parse_pipeline_string  # noqa: E402
+from qvla.core.pipeline import parse_pipeline_string  # noqa: E402
 from qvla.runtime import list_target_modules  # noqa: E402
 
 _SUBCOMMANDS = frozenset({"build", "debug-regex"})
-_WEIGHT_QUANT_CHOICES: tuple[WeightQuantizer, ...] = ("gptq", "rtn", "rtn_residual")
-_ACT_SCALE_CHOICES: tuple[ActScaleMode, ...] = ("per_step", "static", "dynamic")
-_ACT_SCALE_GRANULARITY_CHOICES: tuple[ActScaleGranularity, ...] = (
-    "per_channel",
-    "per_token",
+_MODEL_CHOICES = ("pi05", "groot_n17")
+# Argparse choices — derived from config Literals so typing and CLI stay synced.
+_WEIGHT_QUANT_CHOICES: tuple[WeightQuantizer, ...] = get_args(WeightQuantizer)
+_QUANT_FORMAT_CHOICES: tuple[QuantFormat, ...] = get_args(QuantFormat)
+_ACT_SCALE_CHOICES: tuple[ActScaleMode, ...] = get_args(ActScaleMode)
+_ACT_SCALE_GRANULARITY_CHOICES: tuple[ActScaleGranularity, ...] = get_args(
+    ActScaleGranularity
 )
-_ACT_PERCENTILE_MODE_CHOICES: tuple[ActPercentileMode, ...] = (
-    "inner",
-    "cross",
+_ACT_PERCENTILE_MODE_CHOICES: tuple[ActPercentileMode, ...] = get_args(ActPercentileMode)
+_ACT_OUTLIER_FIT_TOKENS_CHOICES: tuple[ActOutlierFitTokens, ...] = get_args(
+    ActOutlierFitTokens
 )
-_FISHER_STEP_AGG_CHOICES = (
-    "uniform", "max", "late_mean", "very_late_mean", "weighted_linear"
+_FISHER_STEP_AGG_CHOICES: tuple[StepAggregation, ...] = get_args(StepAggregation)
+_FISHER_METHOD_CHOICES: tuple[FisherMethod, ...] = get_args(FisherMethod)
+_FISHER_TYPE_CHOICES: tuple[FisherType, ...] = get_args(FisherType)
+_CALIB_STEP_AGG_CHOICES: tuple[CalibrationStepAggregation, ...] = get_args(
+    CalibrationStepAggregation
 )
-_FISHER_METHOD_CHOICES = ("exact", "hutchinson")
-_CALIB_STEP_AGG_CHOICES = (
-    "uniform", "late_mean", "very_late_mean", "weighted_linear"
-)
-_PERM_SCORE_CHOICES: tuple[PermScore, ...] = (
-    "weight",
-    "activation",
-    "activation_weight",
-    "fisher",
-)
-_SVD_SOURCE_CHOICES: tuple[SvdSource, ...] = ("weight", "activation")
+_PERM_SCORE_CHOICES: tuple[PermScore, ...] = get_args(PermScore)
+_SVD_SOURCE_CHOICES: tuple[SvdSource, ...] = get_args(SvdSource)
 
 
 def _setup_logging(verbosity: int) -> None:
@@ -112,6 +121,8 @@ def _normalize_argv(argv: Sequence[str] | None) -> list[str]:
 def _scope_overrides(prefix: str, args: argparse.Namespace) -> dict:
     mapping = {
         f"{prefix}_quant": "weight_quantizer",
+        f"{prefix}_weight_format": "weight_format",
+        f"{prefix}_act_format": "act_format",
         f"{prefix}_pipeline": "pipeline",
         f"{prefix}_weight_bits": "weight_bits",
         f"{prefix}_group_size": "group_size",
@@ -126,6 +137,23 @@ def _scope_overrides(prefix: str, args: argparse.Namespace) -> dict:
         f"{prefix}_gptq_damp_percent": "gptq_damp_percent",
         f"{prefix}_gptq_block_size": "gptq_block_size",
         f"{prefix}_fisher_gptq": "fisher_gptq",
+        f"{prefix}_smooth_alpha": "smooth_alpha",
+        f"{prefix}_smooth_epsilon": "smooth_epsilon",
+        f"{prefix}_smooth_fisher_beta": "smooth_fisher_beta",
+        f"{prefix}_smooth_act_percentile": "smooth_act_percentile",
+        f"{prefix}_smooth_step_pmean_p": "smooth_step_pmean_p",
+        f"{prefix}_act_outlier_kappa": "act_outlier_kappa",
+        f"{prefix}_act_outlier_bulk_percentile": (
+            "act_outlier_bulk_percentile"
+        ),
+        f"{prefix}_act_outlier_std_k": "act_outlier_std_k",
+        f"{prefix}_act_outlier_std_k_down": "act_outlier_std_k_down",
+        f"{prefix}_act_outlier_std_k_up": "act_outlier_std_k_up",
+        f"{prefix}_act_outlier_fit_tokens": "act_outlier_fit_tokens",
+        f"{prefix}_act_outlier_selective_channels": (
+            "act_outlier_selective_channels"
+        ),
+        f"{prefix}_act_outlier_global": "act_outlier_global",
         f"{prefix}_include_regex": "include_regex",
         f"{prefix}_exclude_regex": "exclude_regex",
     }
@@ -138,10 +166,8 @@ def _scope_overrides(prefix: str, args: argparse.Namespace) -> dict:
 
 
 def build_config_from_args(args: argparse.Namespace) -> QVLAConfig:
-    if args.config_json:
-        config = QVLAConfig.from_json(args.config_json)
-    else:
-        config = QVLAConfig.pi05_default()
+    model = args.model
+    config = QVLAConfig.for_model_kind(model)
 
     llm = config.llm
     dit = config.dit
@@ -171,6 +197,8 @@ def build_config_from_args(args: argparse.Namespace) -> QVLAConfig:
         top["calibration_step_aggregation"] = args.calibration_step_aggregation
     if getattr(args, "fisher_action_timestep", None) is not None:
         top["fisher_action_timestep"] = args.fisher_action_timestep
+    if getattr(args, "fisher_type", None) is not None:
+        top["fisher_type"] = args.fisher_type
     if getattr(args, "fisher_method", None) is not None:
         top["fisher_method"] = args.fisher_method
     if getattr(args, "fisher_hutchinson_probes", None) is not None:
@@ -192,7 +220,7 @@ def _pack_bitwidth_label(config: QVLAConfig) -> str:
     dw, da = config.dit.weight_bits, config.dit.act_bits
     if lw == dw and la == da:
         return f"W{lw}A{la}"
-    return f"Wllm{lw}Wditt{dw}Allm{la}Adit{da}"
+    return f"Wllm{lw}Wdit{dw}Allm{la}Adit{da}"
 
 
 def _auto_output_path(args: argparse.Namespace, config: QVLAConfig) -> Path:
@@ -201,7 +229,7 @@ def _auto_output_path(args: argparse.Namespace, config: QVLAConfig) -> Path:
     ckpt = Path(args.checkpoint).resolve()
     out_dir = ckpt.parent / f"{ckpt.name}-packs"
     name = f"{ckpt.name}-{_pack_bitwidth_label(config)}"
-    base = QVLAConfig.pi05_default()
+    base = QVLAConfig.for_model_kind(args.model)
     tags: list[str] = []
     skip_tag_keys = frozenset({"weight_bits", "act_bits"})
 
@@ -231,18 +259,41 @@ def _auto_output_path(args: argparse.Namespace, config: QVLAConfig) -> Path:
 
 
 def build_adapter_kwargs(args: argparse.Namespace) -> dict:
+    calibration_source = getattr(args, "calibration_source", "synthetic")
     kwargs = {
         "checkpoint_path": args.checkpoint,
         "device": args.device,
         "params_dtype": args.params_dtype,
-        "calibration_source": args.calibration_source,
+        "calibration_source": calibration_source,
     }
-    if args.calibration_source == "file":
-        if not args.calibration_data:
+    if calibration_source == "file":
+        calibration_data = getattr(args, "calibration_data", None)
+        if not calibration_data:
             raise ValueError(
                 "--calibration-data is required when --calibration-source=file"
             )
-        kwargs["calibration_data_path"] = args.calibration_data
+        kwargs["calibration_data_path"] = calibration_data
+
+    embodiment_tag = getattr(args, "embodiment_tag", None)
+    processor_model_name_or_path = getattr(args, "processor_model_name_or_path", None)
+    if args.model == "groot_n17":
+        if embodiment_tag is not None:
+            kwargs["embodiment_tag"] = embodiment_tag
+        # Default local Cosmos path when CLI omits the flag.
+        kwargs["processor_model_name_or_path"] = (
+            processor_model_name_or_path or DEFAULT_PROCESSOR_MODEL_NAME_OR_PATH
+        )
+    else:
+        if embodiment_tag is not None:
+            raise ValueError(
+                f"--embodiment-tag is only valid with --model groot_n17; "
+                f"got --model {args.model}."
+            )
+        if processor_model_name_or_path is not None:
+            raise ValueError(
+                f"--processor-model-name-or-path is only valid with "
+                f"--model groot_n17; got --model {args.model}."
+            )
     return kwargs
 
 
@@ -261,6 +312,29 @@ def _add_scope_args(
         help=f"{help_prefix} weight quantizer.",
     )
     g.add_argument(
+        f"--{prefix}-weight-format",
+        choices=_QUANT_FORMAT_CHOICES,
+        default=None,
+        dest=f"{prefix}_weight_format",
+        help=(
+            f"{help_prefix} weight number format: int (signed symmetric "
+            "integer, default), fp (E2M1 micro-float), nvfp (NVFP4 "
+            "two-level scaling). fp/nvfp only support weight_bits=4."
+        ),
+    )
+    g.add_argument(
+        f"--{prefix}-act-format",
+        choices=_QUANT_FORMAT_CHOICES,
+        default=None,
+        dest=f"{prefix}_act_format",
+        help=(
+            f"{help_prefix} activation number format: int (signed symmetric "
+            "integer, default), fp (E2M1 micro-float), nvfp (official NVFP4 "
+            "online two-level; requires act_scale_mode=dynamic). "
+            "fp/nvfp only support act_bits=4."
+        ),
+    )
+    g.add_argument(
         f"--{prefix}-pipeline",
         type=parse_pipeline_string,
         default=None,
@@ -268,8 +342,11 @@ def _add_scope_args(
         metavar="STEPS",
         help=(
             f"{help_prefix} input transform pipeline (comma-separated). "
-            "Steps: perm, svd, hadamard, random_hadamard. Use 'none' to disable. "
-            "Default: perm,svd,hadamard."
+            "Steps: clip, smooth, perm, svd, hadamard, random_hadamard. "
+            "Only allowlisted sequences are accepted (see "
+            "qvla.core.pipeline.ALLOWED_PIPELINES). Examples: none; "
+            "hadamard; clip; clip,hadamard; smooth; clip,smooth; "
+            "clip,smooth,hadamard; perm,svd,hadamard. Default: none."
         ),
     )
     g.add_argument(
@@ -283,7 +360,11 @@ def _add_scope_args(
         type=int,
         default=None,
         dest=f"{prefix}_group_size",
-        help="Weight scale group size along K; -1 means per-channel.",
+        help=(
+            "Weight scale group size along K; -1 means per-channel. Also used "
+            "as the dynamic activation block size when "
+            "act_scale_granularity=per_block. NVFP4 requires 16."
+        ),
     )
     g.add_argument(
         f"--{prefix}-act-bits",
@@ -304,7 +385,8 @@ def _add_scope_args(
         dest=f"{prefix}_act_scale_granularity",
         help=(
             "Activation scale granularity for static / per_step: "
-            "per_channel (default) or per_token."
+            "per_token (default), per_channel, or per_block (dynamic; "
+            "block size comes from group_size)."
         ),
     )
     g.add_argument(
@@ -336,7 +418,10 @@ def _add_scope_args(
         choices=_PERM_SCORE_CHOICES,
         default=None,
         dest=f"{prefix}_perm_score",
-        help="Energy for zigzag perm when pipeline includes perm: weight | activation | activation_weight | fisher.",
+        help=(
+            "Energy for zigzag perm when pipeline includes perm: "
+            "weight | activation | activation_weight | fisher."
+        ),
     )
     g.add_argument(
         f"--{prefix}-svd-source",
@@ -365,6 +450,179 @@ def _add_scope_args(
         help=(
             "Weight GPTQ Hessian by Fisher sensitivity so GPTQ protects "
             "action-sensitive input columns. Requires --{}-quant gptq.".format(prefix)
+        ),
+    )
+    g.add_argument(
+        f"--{prefix}-smooth-alpha",
+        type=float,
+        default=None,
+        dest=f"{prefix}_smooth_alpha",
+        help=(
+            f"{help_prefix} SmoothQuant migration exponent alpha (in [0, 1]; "
+            "0.5 default). 0 -> keep activation, all difficulty to weight; "
+            "1 -> keep weight, all difficulty to activation."
+        ),
+    )
+    g.add_argument(
+        f"--{prefix}-smooth-epsilon",
+        type=float,
+        default=None,
+        dest=f"{prefix}_smooth_epsilon",
+        help=(
+            f"{help_prefix} SmoothQuant epsilon floor on per-channel amax "
+            "before the fractional powers (default 1e-5)."
+        ),
+    )
+    g.add_argument(
+        f"--{prefix}-smooth-fisher-beta",
+        type=float,
+        default=None,
+        dest=f"{prefix}_smooth_fisher_beta",
+        help=(
+            f"{help_prefix} Fisher boost on effective activation amax: "
+            "F̃=F/max(F)∈(0,1], g=(1+beta·F̃)/mean(...), "
+            "ã=a·g, s=ã^alpha/w^{1-alpha} "
+            "(0 disables; >=0). Requires Fisher sensitivities."
+        ),
+    )
+    g.add_argument(
+        f"--{prefix}-smooth-act-percentile",
+        type=float,
+        default=None,
+        dest=f"{prefix}_smooth_act_percentile",
+        help=(
+            f"{help_prefix} Percentile for SmoothQuant numerator a_j: "
+            "100 (default) = hard per-channel absmax; "
+            "e.g. 99.9 = per-forward channel percentile then max "
+            "across forwards (clips rare outliers from dominating s). "
+            "Incompatible with adaptive outlier clip "
+            f"(--{prefix}-act-outlier-kappa > 0 or "
+            f"--{prefix}-act-outlier-std-k > 0)."
+        ),
+    )
+    g.add_argument(
+        f"--{prefix}-smooth-step-pmean-p",
+        type=float,
+        default=None,
+        dest=f"{prefix}_smooth_step_pmean_p",
+        help=(
+            f"{help_prefix} SmoothQuant a_j aggregation over denoise steps: "
+            "omit for the original hard max over all tokens and steps; "
+            "set to p>0 (typically 4) for "
+            "a_j=(mean_t a_j,t^p)^(1/p) from per-step channel absmax. "
+            f"Requires 'smooth' in --{prefix}-pipeline, num_steps>1, and "
+            f"--{prefix}-smooth-act-percentile 100."
+        ),
+    )
+    g.add_argument(
+        f"--{prefix}-act-outlier-kappa",
+        type=float,
+        default=None,
+        dest=f"{prefix}_act_outlier_kappa",
+        help=(
+            f"{help_prefix} Adaptive tip-clip κ for a_j / runtime act_clip "
+            f"(0 disables). Requires 'clip' in --{prefix}-pipeline (e.g. "
+            f"'clip' or 'clip,hadamard'). Concatenate calibration tokens, then "
+            "a_j=min(max_j, κ·P_β(|x|)) with β from "
+            f"--{prefix}-act-outlier-bulk-percentile. With 'smooth' in "
+            f"--{prefix}-pipeline, a_j also fits s. Requires "
+            f"--{prefix}-smooth-act-percentile=100 (default). Mutually "
+            f"exclusive with --{prefix}-act-outlier-std-k > 0."
+        ),
+    )
+    g.add_argument(
+        f"--{prefix}-act-outlier-bulk-percentile",
+        type=float,
+        default=None,
+        dest=f"{prefix}_act_outlier_bulk_percentile",
+        help=(
+            f"{help_prefix} Bulk percentile β ∈ (0, 100) for adaptive tip-clip "
+            "(default 95). Used only when "
+            f"--{prefix}-act-outlier-kappa > 0."
+        ),
+    )
+    g.add_argument(
+        f"--{prefix}-act-outlier-std-k",
+        type=float,
+        default=None,
+        dest=f"{prefix}_act_outlier_std_k",
+        help=(
+            f"{help_prefix} Adaptive tip-clip via mean+k·std for a_j / "
+            "runtime act_clip (0 disables). a_j=min(max_j, μ_j+k·σ_j). "
+            f"Requires 'clip' in --{prefix}-pipeline. Same SmoothQuant wiring "
+            "as kappa. Mutually exclusive "
+            f"with --{prefix}-act-outlier-kappa > 0. Requires "
+            f"--{prefix}-smooth-act-percentile=100 (default). "
+            "DiT fits this independently at every denoise step "
+            "(requires --dit-act-outlier-selective-channels and "
+            "--dit-act-outlier-fit-tokens all|skip_first)."
+        ),
+    )
+    g.add_argument(
+        f"--{prefix}-act-outlier-std-k-down",
+        type=float,
+        default=None,
+        dest=f"{prefix}_act_outlier_std_k_down",
+        help=(
+            f"{help_prefix} DiT-only. Subtracted from "
+            f"--{prefix}-act-outlier-std-k at denoise step 0. "
+            "0 (default) and --*-std-k-up 0 keep the same k at every step. "
+            "Prefix-only layers still use std-k. LLM must leave this unset."
+        ),
+    )
+    g.add_argument(
+        f"--{prefix}-act-outlier-std-k-up",
+        type=float,
+        default=None,
+        dest=f"{prefix}_act_outlier_std_k_up",
+        help=(
+            f"{help_prefix} DiT-only. Added to "
+            f"--{prefix}-act-outlier-std-k at the last denoise step. "
+            "k interpolates from std-k-down to std-k+up. "
+            "Requires std-k - down > 0 and num_steps>=2. "
+            "LLM must leave this unset."
+        ),
+    )
+    g.add_argument(
+        f"--{prefix}-act-outlier-fit-tokens",
+        choices=_ACT_OUTLIER_FIT_TOKENS_CHOICES,
+        default=None,
+        dest=f"{prefix}_act_outlier_fit_tokens",
+        help=(
+            f"{help_prefix} Which tokens enter adaptive tip-clip (default "
+            "image_lang_pad): 'image' or 'image_lang_pad' tip-clip those "
+            "tokens and floor act_clip by max(|rest|); 'all' tip-clips every "
+            "token (no rest floor); 'skip_first' tip-clips tokens after "
+            "position 0 and floors by that token (GR00T DiT state only). "
+            "LLM clip typically uses image_lang_pad. "
+            "DiT clip: pi0.5 requires 'all'; GR00T may use 'skip_first'."
+        ),
+    )
+    g.add_argument(
+        f"--{prefix}-act-outlier-selective-channels",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        dest=f"{prefix}_act_outlier_selective_channels",
+        help=(
+            f"{help_prefix} temporary old/new clip ablation switch. When enabled, "
+            "select channels whose hard amax exceeds "
+            "median+3*1.4826*MAD across channels, then apply the existing "
+            "mean+k*std threshold only to those channels. Requires "
+            f"--{prefix}-act-outlier-std-k>0; no fallback is used. "
+            "Required for DiT clip (per denoise step)."
+        ),
+    )
+    g.add_argument(
+        f"--{prefix}-act-outlier-global",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        dest=f"{prefix}_act_outlier_global",
+        help=(
+            f"{help_prefix} naive layer-global clip baseline. When enabled, "
+            "fit one mean+k*std threshold over all tip |x| in the layer, "
+            "then a_j=min(amax_j, c). Requires "
+            f"--{prefix}-act-outlier-std-k>0. Mutually exclusive with "
+            f"--{prefix}-act-outlier-selective-channels; no fallback is used."
         ),
     )
     g.add_argument(
@@ -398,11 +656,6 @@ def _add_config_args(parser: argparse.ArgumentParser) -> None:
     _add_scope_args(parser, "llm", help_prefix="LLM")
     _add_scope_args(parser, "dit", help_prefix="DiT")
     top = parser.add_argument_group("top-level config")
-    top.add_argument(
-        "--config-json",
-        default=None,
-        help="Base QVLAConfig JSON; explicit flags override it.",
-    )
     top.add_argument(
         "--skip-incompatible",
         action=argparse.BooleanOptionalAction,
@@ -443,8 +696,22 @@ def _add_config_args(parser: argparse.ArgumentParser) -> None:
         dest="fisher_action_timestep",
         help=(
             "Action-chunk timesteps for the Fisher Jacobian: "
-            "'all', one index (e.g. '50' as last for T=50), or comma-separated "
-            "indices (e.g. '0,29,50')."
+            "'all' (default), one index (e.g. '50' as last for T=50), or "
+            "comma-separated indices (e.g. '0,29,50')."
+        ),
+    )
+    fisher.add_argument(
+        "--fisher-type",
+        choices=_FISHER_TYPE_CHOICES,
+        default=None,
+        dest="fisher_type",
+        help=(
+            "Fisher measurement target: "
+            "'input_grad' uses (∂a/∂x)² collapsed to per-input-channel "
+            "(QVLA paper diagonal); "
+            "'output_hessian' back-props to the output activation to get "
+            "per-token importance, then forms the input-side Hessian "
+            "diagonal weighted by those token importances (HBVLA-style)."
         ),
     )
     fisher.add_argument(
@@ -454,7 +721,8 @@ def _add_config_args(parser: argparse.ArgumentParser) -> None:
         dest="fisher_method",
         help=(
             "Fisher estimator: exact (one backward per action dim) or "
-            "hutchinson (random-projection approximation)."
+            "hutchinson (random-projection approximation). Applies to any "
+            "--fisher-type."
         ),
     )
     fisher.add_argument(
@@ -473,8 +741,8 @@ def _add_config_args(parser: argparse.ArgumentParser) -> None:
         default=None,
         dest="fisher_batch_size",
         help=(
-            "Observations per Fisher differentiable forward (default: 4). "
-            "Raises the pi0.5 engine max_batch_size to at least this value."
+            "Observations per Fisher differentiable forward (default: 1). "
+            "Raises the engine max_batch_size to at least this value."
         ),
     )
     top.add_argument(
@@ -483,7 +751,7 @@ def _add_config_args(parser: argparse.ArgumentParser) -> None:
         default=None,
         dest="build_seed",
         help=(
-            "Seed for reproducible random Hadamard and pi0.5 calibration noise "
+            "Seed for reproducible random Hadamard and calibration noise "
             "(default: 0)."
         ),
     )
@@ -513,16 +781,37 @@ def _add_config_args(parser: argparse.ArgumentParser) -> None:
 
 def _add_run_args(parser: argparse.ArgumentParser, *, verbose_default: int) -> None:
     run = parser.add_argument_group("run")
+    run.add_argument(
+        "--model",
+        required=True,
+        choices=_MODEL_CHOICES,
+        help="Model kind: selects adapter and default QVLA recipe.",
+    )
     run.add_argument("--checkpoint", required=True)
     run.add_argument("--device", default="cuda")
     run.add_argument("--params-dtype", default="bfloat16")
+    run.add_argument(
+        "--embodiment-tag",
+        default=None,
+        dest="embodiment_tag",
+        help="GR00T processor embodiment tag (e.g. LIBERO_PANDA). Only valid with --model groot_n17.",
+    )
+    run.add_argument(
+        "--processor-model-name-or-path",
+        default=None,
+        dest="processor_model_name_or_path",
+        help=(
+            "Local Cosmos/VLM path for GR00T tokenizer + image preprocessor "
+            "(default: /data/share/Cosmos-Reason2-2B). Only valid with --model groot_n17."
+        ),
+    )
     run.add_argument("-v", "--verbose", action="count", default=verbose_default)
 
 
 def _build_build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="build-pi05-pack build",
-        description="Build a pi0.5 QVLA W4A4 pack.",
+        prog="build-pack build",
+        description="Build a QVLA W4A4 pack.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
         add_help=False,
     )
@@ -554,7 +843,7 @@ def _build_build_parser() -> argparse.ArgumentParser:
 
 def _build_debug_regex_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="build-pi05-pack debug-regex",
+        prog="build-pack debug-regex",
         description="Print linear modules matched by the include/exclude regexes.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
         add_help=False,
@@ -567,8 +856,8 @@ def _build_debug_regex_parser() -> argparse.ArgumentParser:
 
 def _make_root_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="build-pi05-pack",
-        description="Build and debug pi0.5 QVLA W4A4 packs.",
+        prog="build-pack",
+        description="Build and debug QVLA W4A4 packs (pi05, groot, ...).",
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
     p_build = sub.add_parser(
@@ -610,7 +899,7 @@ def run_build(args: argparse.Namespace) -> int:
             f"got {config.noise_ensemble_k}."
         )
     output_path = _auto_output_path(args, config)
-    adapter = get_adapter("pi05", **build_adapter_kwargs(args))
+    adapter = get_adapter(args.model, **build_adapter_kwargs(args))
 
     def _progress(stage: str, frac: float) -> None:
         sys.stderr.write(f"[{stage:>10}] {frac * 100:5.1f}%\r")
@@ -630,12 +919,7 @@ def run_build(args: argparse.Namespace) -> int:
 
 def run_debug_regex(args: argparse.Namespace) -> int:
     config = build_config_from_args(args)
-    adapter = get_adapter(
-        "pi05",
-        checkpoint_path=args.checkpoint,
-        device=args.device,
-        params_dtype=args.params_dtype,
-    )
+    adapter = get_adapter(args.model, **build_adapter_kwargs(args))
     model = adapter.build_model()
     targets = list_target_modules(model, config)
 

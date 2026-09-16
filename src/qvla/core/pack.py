@@ -32,14 +32,14 @@ from __future__ import annotations
 
 import datetime
 import logging
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import torch
 
 from qvla.config import QVLAConfig
-from qvla.core.rotation import Rotation
+from qvla.core.pipeline import Transform
 
 
 logger = logging.getLogger(__name__)
@@ -64,17 +64,19 @@ class LayerPack:
     out_features: int
     bias_present: bool
 
-    # int4-as-int8 representation. Storage: (out_features, in_features) int8 in [-8, 7].
+    # Quantized weight codes. Storage: (out_features, in_features) int8.
+    # For "int": signed symmetric codes in [-8, 7].
+    # For "fp"/"nvfp": E2M1 codes where abs(code) indexes the magnitude table.
     qweight: torch.Tensor
     weight_scale: torch.Tensor     # (N,) per-channel or (N, K/group_size)
     group_size: int
     weight_bits: int
 
-    # Rotation applied along the input axis of the *original* weight.
-    rotation: Rotation
+    # Transform applied along the input axis of the *original* weight.
+    rotation: Transform
 
-    # Activation quant config (mode + table). When ``act_scale_table is None``
-    # the runtime falls back to dynamic per-token quant.
+    # Activation quant config (mode + table). Static/per-step modes require a
+    # table; dynamic mode computes scales online.
     act_bits: int
     act_scale_mode: str            # "per_step" | "static" | "dynamic"
     act_scale_table: torch.Tensor | None  # per_channel: (in_features,) or (num_steps, in_features);
@@ -88,7 +90,14 @@ class LayerPack:
 
     # Free-form fork for future extensions without bumping format_version.
     extras: dict[str, Any] = field(default_factory=dict)
-    act_scale_granularity: str = "per_channel"  # "per_channel" | "per_token"
+    act_scale_granularity: str = "per_channel"  # "per_channel" | "per_token" | "per_block"
+    # Number format: "int" (default), "fp" (E2M1 single-level),
+    # "nvfp" (official NVFP4 two-level).
+    weight_format: str = "int"
+    # NVFP4 per-block FP8 scales ``(N, K/16)``; None for int/fp.
+    weight_scale_2: torch.Tensor | None = None
+    # Activation number format: "int", "fp" (E2M1), "nvfp" (online NVFP4).
+    act_format: str = "int"
 
     def state_dict(self) -> dict:
         return {
@@ -101,8 +110,15 @@ class LayerPack:
             "weight_scale": self.weight_scale.detach().contiguous().cpu(),
             "group_size": self.group_size,
             "weight_bits": self.weight_bits,
+            "weight_format": self.weight_format,
+            "weight_scale_2": (
+                self.weight_scale_2.detach().contiguous().cpu()
+                if self.weight_scale_2 is not None
+                else None
+            ),
             "rotation": self.rotation.state_dict(),
             "act_bits": self.act_bits,
+            "act_format": self.act_format,
             "act_scale_mode": self.act_scale_mode,
             "act_scale_granularity": self.act_scale_granularity,
             "act_scale_table": (
@@ -118,7 +134,10 @@ class LayerPack:
                 if self.residual is not None
                 else None
             ),
-            "extras": dict(self.extras),
+            "extras": {
+                k: v.detach().contiguous().cpu() if isinstance(v, torch.Tensor) else v
+                for k, v in self.extras.items()
+            },
         }
 
     @classmethod
@@ -133,8 +152,11 @@ class LayerPack:
             weight_scale=sd["weight_scale"],
             group_size=int(sd["group_size"]),
             weight_bits=int(sd["weight_bits"]),
-            rotation=Rotation.from_state_dict(sd["rotation"]),
+            weight_format=sd.get("weight_format", "int"),
+            weight_scale_2=sd.get("weight_scale_2"),
+            rotation=Transform.from_state_dict(sd["rotation"]),
             act_bits=int(sd["act_bits"]),
+            act_format=sd.get("act_format", "int"),
             act_scale_mode=sd["act_scale_mode"],
             act_scale_granularity=sd.get("act_scale_granularity", "per_channel"),
             act_scale_table=sd.get("act_scale_table"),

@@ -5,7 +5,7 @@ Loads one FP engine, runs the standard (non-differentiable) inference path and
 the autograd-safe ``differentiable_step`` replacement on the same calibration
 input and fixed diffusion noise, then reports action-level error metrics.
 
-Use this to verify that ``differentiable_forward.py`` faithfully mirrors
+Use this to verify that ``adapters/pi05/differentiable_forward.py`` faithfully mirrors
 ``PI05WS1Scheduler.step`` before trusting Fisher / policy-aware rotation.
 
 Example::
@@ -104,7 +104,7 @@ def _forward_original(adapter, request) -> torch.Tensor:
 
 
 def _forward_differentiable(adapter, request) -> torch.Tensor:
-    from qvla.build.differentiable_forward import (
+    from qvla.adapters.pi05.differentiable_forward import (
         differentiable_inference_context,
         differentiable_step,
         force_eager_runners,

@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Perm index stability across calibration builds (no pack build required).
 
-Fits zigzag ``perm`` the same way as ``build_pi05_pack`` / ``PipelineRotationBuild``
+Fits zigzag ``perm`` the same way as ``build_pack`` / ``PipelineBuild``
 (activation ``static_cross_channel_amax`` → ``zigzag_permutation``), then measures how often
 repeated "builds" agree.
 
@@ -42,9 +42,9 @@ import analyze_dit_step_activations as dsa  # noqa: E402
 
 from qvla.adapters import get_adapter  # noqa: E402
 from qvla.config import QVLAConfig  # noqa: E402
-from qvla.core.rotation import (  # noqa: E402
+from qvla.core.pipeline import (  # noqa: E402
     PermScore,
-    PipelineRotationBuild,
+    PipelineBuild,
     SvdSource,
     parse_pipeline_string,
     step_needs_activation_calibration,
@@ -162,7 +162,7 @@ def fit_perm_indices(
     if x.shape[-1] != d:
         raise ValueError(f"activation in_features={x.shape[-1]} != weight in_features={d}.")
 
-    builder = PipelineRotationBuild(
+    builder = PipelineBuild(
         d=d,
         block_size=block_size,
         weight=weight,

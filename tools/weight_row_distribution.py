@@ -27,14 +27,14 @@ from typing import Literal
 import torch
 
 from qvla.build.collector import LayerStats
-from qvla.core.rotation import (
+from qvla.core.pipeline import (
     PermScore,
-    PipelineRotationBuild,
+    PipelineBuild,
     SvdSource,
-    _standard_hadamard_blocks,
     step_needs_activation_calibration,
     validate_pipeline,
 )
+from qvla.core.rotation import standard_hadamard_blocks
 
 ChannelMetric = Literal["max_abs", "l2"]
 PipelineStep = Literal["perm", "svd", "hadamard", "random_hadamard"]
@@ -195,7 +195,7 @@ def _validate_block(d: int, block_size: int) -> int:
 
 def _hadamard_blocks(d: int, block_size: int, *, device) -> torch.Tensor:
     num_blocks = _validate_block(d, block_size)
-    return _standard_hadamard_blocks(
+    return standard_hadamard_blocks(
         num_blocks, block_size, device=device, dtype=torch.float32
     )
 
@@ -299,7 +299,7 @@ def _apply_pipeline_core(
                 f"activation_tokens in_features={x_out.shape[-1]} != weight in_features={d}."
             )
 
-    builder = PipelineRotationBuild(
+    builder = PipelineBuild(
         d=d,
         block_size=block_size,
         weight=weight,

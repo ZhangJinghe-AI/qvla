@@ -66,10 +66,11 @@ def _is_linear_like(mod: nn.Module) -> bool:
 def _returns_tuple(mod: nn.Module) -> bool:
     """phyai's ``LinearBase`` subclasses return ``(y, bias)``; nn.Linear returns ``y``.
 
-    Heuristic: a module that exposes ``skip_bias_add`` is a phyai linear.
-    Falls back to checking the class name (``*ParallelLinear`` / ``ReplicatedLinear``).
+    ``GR00TN17Linear`` subclasses ``ReplicatedLinear`` (so it has
+    ``skip_bias_add``) but overrides ``forward`` to return a plain tensor —
+    same contract as ``nn.Linear``. Must be checked before the phyai heuristic.
     """
-    if isinstance(mod, nn.Linear):
+    if type(mod).__name__ == "GR00TN17Linear" or isinstance(mod, nn.Linear):
         return False
     if hasattr(mod, "skip_bias_add"):
         return True
@@ -148,6 +149,7 @@ def _build_replacement(
     original: nn.Module,
     device,
     output_dtype,
+    nvfp_activation_num_samples: int | None,
 ) -> QuantLinear:
     return QuantLinear(
         pack_entry,
@@ -155,6 +157,7 @@ def _build_replacement(
         skip_bias_add=_skip_bias_add(original),
         output_dtype=output_dtype,
         device=device,
+        nvfp_activation_num_samples=nvfp_activation_num_samples,
     )
 
 
@@ -165,6 +168,7 @@ def enable_quantization(
     device: str | None = None,
     output_dtype=None,
     strict: bool = True,
+    nvfp_activation_num_samples: int | None = None,
 ) -> list[str]:
     """Swap every matched linear in ``model`` with an :class:`QuantLinear`.
 
@@ -178,6 +182,9 @@ def enable_quantization(
         strict: if True, raise when a pack layer has no matching module in the
             model (or vice versa, when a model module matches the regex but is
             absent from the pack).
+        nvfp_activation_num_samples: Number of equal, contiguous samples in
+            every NVFP4 activation tensor. Required when the pack quantizes
+            activations as NVFP4.
 
     Returns:
         The list of qualified names that were replaced.
@@ -227,7 +234,13 @@ def enable_quantization(
                 "Using the pack's scope.", name, entry.scope, scope,
             )
         # Build replacement and slot it in.
-        new_mod = _build_replacement(entry, original, device, output_dtype)
+        new_mod = _build_replacement(
+            entry,
+            original,
+            device,
+            output_dtype,
+            nvfp_activation_num_samples,
+        )
         _set_submodule(model, name, new_mod)
         replaced.append(name)
 

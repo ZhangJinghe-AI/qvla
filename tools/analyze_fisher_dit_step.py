@@ -34,7 +34,7 @@ import analyze_dit_step_activations as dsa  # noqa: E402
 from qvla.adapters import get_adapter  # noqa: E402
 from qvla.adapters.pi05.obs import build_pi05_request  # noqa: E402
 from qvla.adapters.pi05.step_hook import patched_one_step  # noqa: E402
-from qvla.build.fisher import FisherCollector, resolve_fisher_action_dim  # noqa: E402
+from qvla.build.fisher import InputGradFisherCollector, resolve_fisher_action_dim  # noqa: E402
 from qvla.config import QVLAConfig  # noqa: E402
 from qvla.runtime import list_target_modules  # noqa: E402
 
@@ -80,7 +80,7 @@ def _make_noise(adapter, seed: int) -> torch.Tensor:
 def _differentiable_forward(adapter, sched, batch: dict, *, noise: torch.Tensor | None):
     from dataclasses import replace
 
-    from qvla.build.differentiable_forward import differentiable_step
+    from qvla.adapters.pi05.differentiable_forward import differentiable_step
 
     adapter._ensure_processor()
     request = build_pi05_request(adapter._processor, batch, state_dim=adapter.cfg.state_dim)
@@ -100,7 +100,7 @@ def _collect_fisher_per_step(
     fisher_method: str = "exact",
     hutchinson_probes: int = 8,
 ) -> dict[str, dict[int, torch.Tensor]]:
-    from qvla.build.differentiable_forward import (
+    from qvla.adapters.pi05.differentiable_forward import (
         differentiable_inference_context,
         force_eager_runners,
         reset_differentiable_state,
@@ -113,7 +113,7 @@ def _collect_fisher_per_step(
     runner = sched.expert_runner
 
     with differentiable_inference_context(sched):
-        with FisherCollector(
+        with InputGradFisherCollector(
             targets, num_dit_steps, action_dim=resolve_fisher_action_dim(adapter)
         ) as fc:
             fc.begin_sample()

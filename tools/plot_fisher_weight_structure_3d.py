@@ -162,7 +162,7 @@ def _collect_maps(
         raise ValueError(
             f"hutchinson_probes must be >= 1, got {hutchinson_probes}."
         )
-    from qvla.build.differentiable_forward import (
+    from qvla.adapters.pi05.differentiable_forward import (
         differentiable_inference_context,
         force_eager_runners,
         reset_differentiable_state,

@@ -36,6 +36,13 @@ def _load_pi05(**kwargs) -> ModelAdapter:
     return PI05Adapter(PI05AdapterConfig.from_checkpoint(**kwargs))
 
 
+@register_adapter("groot_n17")
+def _load_groot(**kwargs) -> ModelAdapter:
+    from qvla.adapters.groot import GR00TAdapter, GR00TAdapterConfig
+
+    return GR00TAdapter(GR00TAdapterConfig.from_checkpoint(**kwargs))
+
+
 def get_adapter(model_kind: str, **kwargs) -> ModelAdapter:
     """Factory: lazy-import and instantiate the named adapter."""
     try:

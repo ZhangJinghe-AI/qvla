@@ -5,10 +5,10 @@ from qvla.build.collector import (
     LayerStats,
     RotatedActivationCollector,
 )
-from qvla.build.fisher import FisherCollector, compute_fisher_sensitivity
+from qvla.build.fisher import InputGradFisherCollector, compute_fisher_sensitivity
 
 __all__ = [
-    "FisherCollector",
+    "InputGradFisherCollector",
     "LayerStats",
     "RotatedActivationCollector",
     "build_pack",

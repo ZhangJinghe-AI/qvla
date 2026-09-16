@@ -1,18 +1,9 @@
-"""DuQuant-style rotation matrices (QVLA / DuQuant composite transform).
+"""Low-level rotation / transform math primitives.
 
-The input-side transform is a configurable **pipeline** of steps applied
-left-to-right at runtime:
+Hadamard matrices, SVD block rotations, zigzag permutations, and the
+block-diagonal matmul that underlies all per-block transforms.
 
-* ``perm`` — zigzag channel reorder (optional)
-* ``svd`` — per-block orthonormal ``U`` from weight / activation stats
-* ``hadamard`` — standard Sylvester block Hadamard (deterministic, not stored)
-* ``random_hadamard`` — random sign-flipped Hadamard ``H @ diag(±1)`` (fitted once, stored in pack)
-
-``U`` is stored in ``u_blocks``. Calibration and runtime both follow the same
-pipeline: steps not listed are skipped entirely.
-
-All transforms preserve ``y = x Wᵀ`` when the same pipeline is applied to
-``W`` offline (via :func:`apply_input_pipeline` / :meth:`Rotation.apply`).
+Higher-level pipeline orchestration lives in :mod:`qvla.core.pipeline`.
 """
 
 from __future__ import annotations
@@ -20,53 +11,39 @@ from __future__ import annotations
 import hashlib
 import logging
 import math
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal
+from typing import Literal
 
 import torch
 
-if TYPE_CHECKING:
-    from qvla.build.collector import LayerStats
-
 PermScore = Literal["weight", "activation", "activation_weight", "fisher"]
 SvdSource = Literal["weight", "activation"]
-PipelineStep = Literal["perm", "svd", "hadamard", "random_hadamard"]
-
-_VALID_STEPS = frozenset({"perm", "svd", "hadamard", "random_hadamard"})
+PipelineStep = Literal[
+    "clip", "smooth", "perm", "svd", "hadamard", "random_hadamard"
+]
 
 logger = logging.getLogger(__name__)
 
 
-def _is_pow2(n: int) -> bool:
+def is_pow2(n: int) -> bool:
     return n > 0 and (n & (n - 1)) == 0
 
 
-def validate_pipeline(
-    pipeline: tuple[PipelineStep, ...],
-) -> tuple[PipelineStep, ...]:
-    for step in pipeline:
-        if step not in _VALID_STEPS:
-            raise ValueError(
-                f"Invalid pipeline step {step!r}; expected perm|svd|hadamard|random_hadamard."
-            )
-    return pipeline
-
-
-def parse_pipeline_string(value: str) -> tuple[PipelineStep, ...]:
-    """Parse CLI / JSON pipeline strings like ``perm,svd,hadamard``."""
-    text = value.strip().lower()
-    if text in ("", "none", "identity"):
-        return ()
-    steps = tuple(s.strip() for s in text.split(",") if s.strip())
-    return validate_pipeline(steps)  # type: ignore[arg-type]
+def validate_block(d: int, block_size: int) -> int:
+    if not is_pow2(block_size):
+        raise ValueError(f"block_size={block_size} must be a power of two.")
+    if d % block_size != 0:
+        raise ValueError(
+            f"d={d} not divisible by block_size={block_size}; pick a smaller "
+            "block (QVLA padding logic is intentionally not implemented "
+            "here to keep the math obvious; channel-pad upstream if you need it)."
+        )
+    return d // block_size
 
 
 def hadamard_matrix(n: int, *, dtype: torch.dtype = torch.float32, device=None) -> torch.Tensor:
     """Sylvester construction of an `n×n` Hadamard matrix, normalized to be orthonormal."""
-    if not _is_pow2(n):
+    if not is_pow2(n):
         raise ValueError(f"hadamard_matrix(n={n}): n must be a power of two.")
-    # torch.ones allocates directly on `device`; torch.tensor([[1.0]]) would
-    # stage on CPU first and break CUDA graph capture (implicit H2D copy).
     h = torch.ones(1, 1, dtype=dtype, device=device)
     while h.shape[0] < n:
         h = torch.cat(
@@ -74,12 +51,6 @@ def hadamard_matrix(n: int, *, dtype: torch.dtype = torch.float32, device=None) 
             dim=0,
         )
     return h / math.sqrt(n)
-
-
-def _random_hadamard_seed(layer_name: str, build_seed: int) -> int:
-    """Per-layer seed for random Hadamard (stable across runs and RNG draw order)."""
-    digest = hashlib.sha256(f"{build_seed}:{layer_name}".encode()).digest()
-    return int.from_bytes(digest[:8], "big") % (2**63 - 1)
 
 
 def random_hadamard_matrix(
@@ -97,19 +68,13 @@ def random_hadamard_matrix(
     return h * signs.unsqueeze(0)
 
 
-def _validate_block(d: int, block_size: int) -> int:
-    if not _is_pow2(block_size):
-        raise ValueError(f"block_size={block_size} must be a power of two.")
-    if d % block_size != 0:
-        raise ValueError(
-            f"d={d} not divisible by block_size={block_size}; pick a smaller "
-            "block (QVLA padding logic is intentionally not implemented "
-            "here to keep the math obvious; channel-pad upstream if you need it)."
-        )
-    return d // block_size
+def random_hadamard_seed(layer_name: str, build_seed: int) -> int:
+    """Per-layer seed for random Hadamard (stable across runs and RNG draw order)."""
+    digest = hashlib.sha256(f"{build_seed}:{layer_name}".encode()).digest()
+    return int.from_bytes(digest[:8], "big") % (2**63 - 1)
 
 
-def _standard_hadamard_blocks(
+def standard_hadamard_blocks(
     num_blocks: int,
     block_size: int,
     *,
@@ -120,7 +85,7 @@ def _standard_hadamard_blocks(
     return h.unsqueeze(0).expand(num_blocks, -1, -1).contiguous()
 
 
-def _random_hadamard_blocks(
+def random_hadamard_blocks(
     num_blocks: int,
     block_size: int,
     *,
@@ -137,7 +102,7 @@ def _random_hadamard_blocks(
     return h.unsqueeze(0).expand(num_blocks, -1, -1).contiguous()
 
 
-def _apply_block_matmul(
+def apply_block_matmul(
     x: torch.Tensor,
     blocks: torch.Tensor,
     *,
@@ -157,154 +122,6 @@ def _apply_block_matmul(
     blk = blocks.to(device=flat.device, dtype=flat.dtype)
     rotated = torch.einsum("tnb,nbc->tnc", flat, blk)
     return rotated.reshape(*lead, d)
-
-
-def apply_input_pipeline(
-    x: torch.Tensor,
-    *,
-    pipeline: tuple[PipelineStep, ...],
-    u_blocks: torch.Tensor | None,
-    perm: torch.Tensor | None,
-    block_size: int,
-    d: int,
-    random_hadamard_blocks: torch.Tensor | None = None,
-) -> torch.Tensor:
-    out = x
-    num_blocks = d // block_size
-    for step in pipeline:
-        if step == "perm":
-            if perm is None:
-                continue
-            out = out.index_select(dim=-1, index=perm.to(out.device))
-        elif step == "svd":
-            if u_blocks is not None:
-                out = _apply_block_matmul(
-                    out, u_blocks, block_size=block_size, d=d
-                )
-        elif step == "hadamard":
-            h_blocks = _standard_hadamard_blocks(
-                num_blocks, block_size, device=out.device, dtype=out.dtype
-            )
-            out = _apply_block_matmul(out, h_blocks, block_size=block_size, d=d)
-        elif step == "random_hadamard":
-            if random_hadamard_blocks is not None:
-                h_blocks = random_hadamard_blocks.to(
-                    device=out.device, dtype=out.dtype
-                )
-            else:
-                h_blocks = _random_hadamard_blocks(
-                    num_blocks, block_size, device=out.device, dtype=out.dtype
-                )
-            out = _apply_block_matmul(out, h_blocks, block_size=block_size, d=d)
-        else:
-            raise ValueError(f"Unknown pipeline step {step!r}.")
-    return out
-
-
-@dataclass
-class Rotation:
-    """Block-diagonal rotation plus optional zigzag permutation.
-
-    ``perm`` maps output slot → original channel index:
-    ``x_perm[..., k] = x[..., perm[k]]`` (same convention as DuQuant /
-    ``index_select(-1, perm)``).
-    """
-
-    mode: str
-    block_size: int
-    d: int
-    u_blocks: torch.Tensor | None = None
-    perm: torch.Tensor | None = None
-    random_hadamard_blocks: torch.Tensor | None = None
-    pipeline: tuple[PipelineStep, ...] = ("perm", "svd", "hadamard")
-    meta: dict | None = None
-
-    @property
-    def is_identity(self) -> bool:
-        return not self.pipeline
-            
-
-    def apply(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply the configured pipeline along the last axis."""
-        if self.is_identity:
-            return x
-        return apply_input_pipeline(
-            x,
-            pipeline=self.pipeline,
-            u_blocks=self.u_blocks,
-            perm=self.perm,
-            block_size=self.block_size,
-            d=self.d,
-            random_hadamard_blocks=self.random_hadamard_blocks,
-        )
-
-    def state_dict(self) -> dict:
-        sd: dict = {
-            "mode": self.mode,
-            "block_size": self.block_size,
-            "d": self.d,
-            "pipeline": list(self.pipeline),
-            "perm": (
-                self.perm.detach().to(torch.int64).cpu()
-                if self.perm is not None
-                else None
-            ),
-            "meta": dict(self.meta or {}),
-        }
-        if self.u_blocks is not None:
-            sd["u_blocks"] = self.u_blocks.detach().to(torch.float32).cpu()
-        if self.random_hadamard_blocks is not None:
-            sd["random_hadamard_blocks"] = (
-                self.random_hadamard_blocks.detach().to(torch.float32).cpu()
-            )
-        return sd
-
-    @classmethod
-    def from_state_dict(cls, sd: dict) -> "Rotation":
-        perm = sd.get("perm")
-        pipeline_raw = sd.get("pipeline")
-        u_blocks = sd.get("u_blocks")
-        random_hadamard_blocks = sd.get("random_hadamard_blocks")
-        pipeline = tuple(pipeline_raw) if pipeline_raw is not None else ()
-
-        return cls(
-            mode=sd["mode"],
-            block_size=int(sd["block_size"]),
-            d=int(sd["d"]),
-            u_blocks=u_blocks.clone() if u_blocks is not None else None,
-            perm=perm.clone() if perm is not None else None,
-            random_hadamard_blocks=(
-                random_hadamard_blocks.clone()
-                if random_hadamard_blocks is not None
-                else None
-            ),
-            pipeline=pipeline,
-            meta=dict(sd.get("meta") or {}),
-        )
-
-
-def identity_rotation(d: int, block_size: int) -> Rotation:
-    return Rotation(
-        mode="none",
-        block_size=block_size,
-        d=d,
-        u_blocks=None,
-        perm=None,
-        pipeline=(),
-    )
-
-
-def hadamard_rotation(d: int, block_size: int, *, device=None) -> Rotation:
-    """Pure standard block-Hadamard rotation. No data needed."""
-    _validate_block(d, block_size)
-    return Rotation(
-        mode="hadamard",
-        block_size=block_size,
-        d=d,
-        u_blocks=None,
-        perm=None,
-        pipeline=("hadamard",),
-    )
 
 
 def zigzag_permutation_omega_qvla(energy: torch.Tensor) -> torch.Tensor:
@@ -455,7 +272,7 @@ def compute_block_rotation_from_activation_cov(
     return eigvecs.contiguous()
 
 
-def _u_for_block(
+def u_for_block(
     weight_block: torch.Tensor | None,
     sigma_b: torch.Tensor | None,
     *,
@@ -472,7 +289,7 @@ def _u_for_block(
     return compute_block_rotation_from_activation_cov(sigma_b, eps=eps)
 
 
-def _fit_u_blocks(
+def fit_u_blocks(
     *,
     d: int,
     block_size: int,
@@ -493,7 +310,7 @@ def _fit_u_blocks(
     Block ``i`` uses ``cov[i*bs:(i+1)*bs, i*bs:(i+1)*bs]``. The builder
     guarantees this via pipeline-wise calibration passes.
     """
-    num_blocks = _validate_block(d, block_size)
+    num_blocks = validate_block(d, block_size)
     w = weight.detach().to(torch.float32)
     cov_fp32 = (
         activation_cov.to(torch.float32)
@@ -520,7 +337,7 @@ def _fit_u_blocks(
                 d_sqrt = sens.sqrt()
                 sigma_b = sigma_b * d_sqrt.unsqueeze(1) * d_sqrt.unsqueeze(0)
 
-        u_blocks[i] = _u_for_block(
+        u_blocks[i] = u_for_block(
             w_block,
             sigma_b,
             svd_source=svd_source,
@@ -530,7 +347,7 @@ def _fit_u_blocks(
     return u_blocks.contiguous()
 
 
-def _zigzag_from_stats(
+def zigzag_from_stats(
     weight: torch.Tensor,
     *,
     u_blocks: torch.Tensor | None,
@@ -542,17 +359,28 @@ def _zigzag_from_stats(
     sensitivity: torch.Tensor | None,
     eps: float,
     random_hadamard_blocks: torch.Tensor | None = None,
+    act_clip: torch.Tensor | None = None,
+    smooth_scale: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, str]:
+    from qvla.core.pipeline import apply_input_pipeline
+
+    del act_clip  # activation-only; never applied to weight for perm scoring
+
     w_for_perm = weight
-    if pre_perm_pipeline and perm_score in ("weight", "activation_weight"):
+    # Weight-side only: skip activation-only ``clip``. (Smooth never appears
+    # before ``perm`` in ALLOWED_PIPELINES; orthogonal prefix steps are shared.)
+    weight_pipeline = tuple(s for s in pre_perm_pipeline if s != "clip")
+    if weight_pipeline and perm_score in ("weight", "activation_weight"):
         w_for_perm = apply_input_pipeline(
             weight.to(torch.float32),
-            pipeline=pre_perm_pipeline,
+            pipeline=weight_pipeline,
             u_blocks=u_blocks,
             perm=None,
             block_size=block_size,
             d=d,
             random_hadamard_blocks=random_hadamard_blocks,
+            act_clip=None,
+            smooth_scale=smooth_scale,
         ).contiguous()
     energy, score_used = compute_perm_energy(
         w_for_perm,
@@ -564,201 +392,24 @@ def _zigzag_from_stats(
     return zigzag_permutation(energy, block_size=block_size), score_used
 
 
-def step_needs_activation_calibration(
-    step: PipelineStep,
-    *,
-    perm_score: PermScore,
-    svd_source: SvdSource,
-) -> bool:
-    """True when a pipeline step needs activation stats at its input."""
-    if step == "perm":
-        return perm_score in ("activation", "activation_weight")
-    if step == "svd":
-        return svd_source == "activation"
-    return False
-
-
-@dataclass
-class PipelineRotationBuild:
-    """Incrementally fit a :class:`Rotation` one pipeline step at a time."""
-
-    d: int
-    block_size: int
-    weight: torch.Tensor
-    pipeline: tuple[PipelineStep, ...]
-    perm_score: PermScore
-    svd_source: SvdSource
-    sensitivity: torch.Tensor | None = None
-    eps: float = 1e-6
-    layer_name: str | None = None
-    build_seed: int = 0
-    perm: torch.Tensor | None = None
-    u_blocks: torch.Tensor | None = None
-    random_hadamard_blocks: torch.Tensor | None = None
-    meta: dict | None = None
-
-    def __post_init__(self) -> None:
-        if self.meta is None:
-            self.meta = {
-                "svd_source": self.svd_source,
-                "perm_score": self.perm_score,
-                "pipeline": list(self.pipeline),
-            }
-
-    def prefix_rotation(self, step_index: int) -> Rotation:
-        """Rotation applying ``pipeline[:step_index]`` with components fit so far."""
-        prefix = self.pipeline[:step_index]
-        if not prefix:
-            return identity_rotation(self.d, self.block_size)
-        perm = None
-        u_blocks = None
-        random_hadamard_blocks = None
-        if "perm" in prefix:
-            perm_idx = self.pipeline.index("perm")
-            if perm_idx < step_index:
-                perm = self.perm
-        if "svd" in prefix:
-            svd_idx = self.pipeline.index("svd")
-            if svd_idx < step_index:
-                u_blocks = self.u_blocks
-        if "random_hadamard" in prefix:
-            rh_idx = self.pipeline.index("random_hadamard")
-            if rh_idx < step_index:
-                random_hadamard_blocks = self.random_hadamard_blocks
-        return Rotation(
-            mode="+".join(prefix),
-            block_size=self.block_size,
-            d=self.d,
-            u_blocks=u_blocks,
-            perm=perm,
-            random_hadamard_blocks=random_hadamard_blocks,
-            pipeline=prefix,
-            meta=dict(self.meta or {}),
-        )
-
-    def fit_step(
-        self,
-        step_index: int,
-        *,
-        stats: LayerStats | None = None,
-    ) -> None:
-        """Fit ``pipeline[step_index]`` using optional activation stats at its input."""
-        step = self.pipeline[step_index]
-        pre = self.pipeline[:step_index]
-        w = self.weight.detach().to(torch.float32)
-        device = w.device
-
-        if step == "perm":
-            amax = (
-                stats.static_cross_channel_amax.to(device)
-                if stats is not None and stats.n_tokens > 0
-                else None
-            )
-            sens = (
-                self.sensitivity.to(device)
-                if self.sensitivity is not None
-                else None
-            )
-            self.perm, score_used = _zigzag_from_stats(
-                w,
-                u_blocks=self.u_blocks,
-                pre_perm_pipeline=pre,
-                block_size=self.block_size,
-                d=self.d,
-                perm_score=self.perm_score,
-                activation_amax=amax,
-                sensitivity=sens,
-                eps=self.eps,
-                random_hadamard_blocks=self.random_hadamard_blocks,
-            )
-            self.meta["perm_score_used"] = score_used
-        elif step == "svd":
-            cov = (
-                stats.covariance().to(device)
-                if stats is not None and stats.n_tokens > 0
-                else None
-            )
-            sens = (
-                self.sensitivity.to(device)
-                if self.sensitivity is not None
-                else None
-            )
-            self.u_blocks = _fit_u_blocks(
-                d=self.d,
-                block_size=self.block_size,
-                weight=w,
-                activation_cov=cov,
-                svd_source=self.svd_source,
-                perm=self.perm,
-                sensitivity=sens,
-                eps=self.eps,
-            )
-        elif step == "hadamard":
-            pass
-        elif step == "random_hadamard":
-            if self.random_hadamard_blocks is None:
-                num_blocks = _validate_block(self.d, self.block_size)
-                layer = self.layer_name or f"d{self.d}_bs{self.block_size}"
-                seed = _random_hadamard_seed(layer, self.build_seed)
-                self.random_hadamard_blocks = _random_hadamard_blocks(
-                    num_blocks,
-                    self.block_size,
-                    device=device,
-                    seed=seed,
-                )
-        else:
-            raise ValueError(f"Unknown pipeline step {step!r}.")
-
-    def finish(self) -> Rotation:
-        """Return the fully fitted rotation."""
-        if not self.pipeline:
-            return identity_rotation(self.d, self.block_size)
-        if self.pipeline == ("hadamard",):
-            try:
-                return hadamard_rotation(self.d, self.block_size)
-            except ValueError as e:
-                label = self.layer_name or "layer"
-                logger.warning(
-                    "Skipping rotation for %s (K=%d, block_size=%d): %s",
-                    label,
-                    self.d,
-                    self.block_size,
-                    e,
-                )
-                return identity_rotation(self.d, self.block_size)
-        try:
-            return Rotation(
-                mode="+".join(self.pipeline),
-                block_size=self.block_size,
-                d=self.d,
-                u_blocks=self.u_blocks,
-                perm=self.perm,
-                random_hadamard_blocks=self.random_hadamard_blocks,
-                pipeline=self.pipeline,
-                meta=dict(self.meta or {}),
-            )
-        except ValueError as e:
-            label = self.layer_name or "layer"
-            logger.warning(
-                "Skipping rotation for %s (K=%d, block_size=%d): %s",
-                label,
-                self.d,
-                self.block_size,
-                e,
-            )
-            return identity_rotation(self.d, self.block_size)
-
-
 __all__ = [
     "PermScore",
     "PipelineStep",
-    "PipelineRotationBuild",
-    "Rotation",
     "SvdSource",
+    "apply_block_matmul",
+    "compute_block_rotation_from_activation_cov",
+    "compute_block_rotation_from_weight",
+    "compute_perm_energy",
+    "fit_u_blocks",
     "hadamard_matrix",
-    "identity_rotation",
-    "parse_pipeline_string",
+    "is_pow2",
+    "random_hadamard_blocks",
     "random_hadamard_matrix",
-    "step_needs_activation_calibration",
-    "validate_pipeline",
+    "random_hadamard_seed",
+    "standard_hadamard_blocks",
+    "u_for_block",
+    "validate_block",
+    "zigzag_from_stats",
+    "zigzag_permutation",
+    "zigzag_permutation_omega_qvla",
 ]

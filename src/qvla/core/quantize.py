@@ -98,8 +98,279 @@ def channel_percentile_amax(
     )
 
 
+
 # --------------------------------------------------------------------------- #
-# RTN — round-to-nearest.                                                     #
+# FP4 (E2M1) grid — micro-float quantization.                                 #
+# --------------------------------------------------------------------------- #
+
+# E2M1 representable magnitudes (bias=1): ±{0, 0.5, 1, 1.5, 2, 3, 4, 6}.
+# 4-bit signed: 1 sign + 2 exponent + 1 mantissa → 16 codes total.
+_FP4_E2M1_VALUES = torch.tensor(
+    [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32
+)
+_FP4_E2M1_VALUES_CACHE: dict[str, torch.Tensor] = {}
+_FP4_E2M1_GRID_CACHE: dict[str, torch.Tensor] = {}
+
+
+def warmup_fp4_cuda_tensors(device: torch.device | str) -> None:
+    """Pre-allocate FP4 lookup tables on ``device`` before CUDA graph capture.
+
+    CUDA graph capture forbids CPU→GPU copies unless the source tensor is
+    pinned. NVFP4 activation quant reads module-level CPU constants; warm
+    them up outside capture so graph replay only touches device-resident
+    tensors.
+    """
+    dev = torch.device(device)
+    if dev.type != "cuda":
+        return
+    _fp4_e2m1_grid(dev)
+    _fp4_e2m1_values_on(dev)
+
+
+def _fp4_e2m1_values_on(device: torch.device) -> torch.Tensor:
+    key = str(device)
+    cached = _FP4_E2M1_VALUES_CACHE.get(key)
+    if cached is None:
+        cached = _FP4_E2M1_VALUES.to(device=device)
+        _FP4_E2M1_VALUES_CACHE[key] = cached
+    return cached
+
+
+def _fp4_e2m1_grid(device: torch.device | None = None) -> torch.Tensor:
+    """Full signed E2M1 grid: [-6, ..., -0.5, 0, 0.5, ..., 6] (15 unique)."""
+    dev = device or torch.device("cpu")
+    key = str(dev)
+    cached = _FP4_E2M1_GRID_CACHE.get(key)
+    if cached is None:
+        pos = _fp4_e2m1_values_on(dev)
+        neg = -pos[1:].flip(0)
+        cached = torch.cat([neg, pos])
+        _FP4_E2M1_GRID_CACHE[key] = cached
+    return cached
+
+
+def _nearest_on_sorted_grid(
+    values: torch.Tensor, sorted_grid: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Nearest-neighbour on a 1-D sorted grid with O(N) memory."""
+    n = sorted_grid.numel()
+    if n == 0:
+        raise ValueError("sorted_grid must be non-empty")
+    if n == 1:
+        idx = torch.zeros_like(values, dtype=torch.long)
+        return sorted_grid[idx], idx
+
+    idx = torch.searchsorted(sorted_grid, values, right=False).clamp(1, n - 1)
+    lower = sorted_grid[idx - 1]
+    upper = sorted_grid[idx]
+    dist_lower = (values - lower).abs()
+    dist_upper = (values - upper).abs()
+    pick_upper = dist_upper < dist_lower
+    out_idx = torch.where(pick_upper, idx, idx - 1)
+    return sorted_grid[out_idx], out_idx
+
+
+def _fp4_e2m1_quantize(
+    scaled: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Nearest-neighbour round onto the signed E2M1 grid.
+
+    ``scaled`` is already ``w / scale`` (any shape). Returns
+    ``(codes_int8, q_vals)`` where ``q_vals`` has the same shape as
+    ``scaled`` and ``codes`` encodes ``sign * index`` into
+    ``_FP4_E2M1_VALUES``.
+    """
+    pos = _fp4_e2m1_values_on(scaled.device)
+    orig_shape = scaled.shape
+    flat = scaled.reshape(-1)
+    signs = flat.sign()
+    q_abs, code_idx = _nearest_on_sorted_grid(flat.abs(), pos)
+    q_vals = (q_abs * signs).reshape(orig_shape)
+    codes = (code_idx * signs.to(torch.int8)).to(torch.int8).reshape(orig_shape)
+    return codes, q_vals
+
+
+def _fp4_e2m1_dequantize(codes: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """Convert int8 E2M1 codes back to float values."""
+    pos = _fp4_e2m1_values_on(device)
+    abs_codes = codes.abs().to(torch.long).clamp(max=7)
+    magnitudes = pos[abs_codes]
+    return magnitudes * codes.sign().to(magnitudes.dtype)
+
+
+# --------------------------------------------------------------------------- #
+# NVFP4 — official NVIDIA hierarchical scaling (Transformer Engine).          #
+#                                                                             #
+#   x ≈ x_e2m1 * s_block * s_global                                           #
+#                                                                             #
+#   s_global = global_amax / (FP8_E4M3_MAX * FP4_E2M1_MAX)   # FP32           #
+#   s_block  = (block_amax / FP4_E2M1_MAX) / s_global        # FP8 E4M3       #
+#   block size = 16                                                           #
+# --------------------------------------------------------------------------- #
+
+NVFP4_BLOCK_SIZE = 16
+FP8_E4M3_MAX = 448.0
+FP4_E2M1_MAX = 6.0
+
+
+def _validate_nvfp4_group_size(group_size: int) -> None:
+    if group_size != NVFP4_BLOCK_SIZE:
+        raise ValueError(
+            f"NVFP4 requires group_size={NVFP4_BLOCK_SIZE}, got {group_size}."
+        )
+
+
+def _cast_fp8_e4m3(x: torch.Tensor) -> torch.Tensor:
+    """Round-trip through FP8 E4M3 (hardware storage dtype for NVFP4 block scales).
+
+    Clamp to the E4M3 finite range *before* casting — oversized values become
+    NaN under ``float8_e4m3fn``, and a post-cast ``clamp_min`` cannot recover.
+    """
+    return (
+        x.clamp(min=0.0, max=FP8_E4M3_MAX)
+        .to(torch.float8_e4m3fn)
+        .to(torch.float32)
+    )
+
+
+def _nvfp4_compute_scales(
+    w: torch.Tensor,
+    group_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Official NVFP4 two-level scales for a ``(N, K)`` weight.
+
+    Returns ``(s_global, s_block)`` where ``s_global`` is shape ``(1,)`` FP32
+    and ``s_block`` is shape ``(N, K/group_size)`` after FP8 E4M3 cast.
+    """
+    _validate_nvfp4_group_size(group_size)
+    N, K = w.shape
+    if K % group_size != 0:
+        raise ValueError(
+            f"NVFP4 requires K divisible by group_size={group_size}, got K={K}."
+        )
+    global_amax = w.abs().amax().clamp_min(1e-12)
+    s_global = (global_amax / (FP8_E4M3_MAX * FP4_E2M1_MAX)).reshape(1)
+
+    w_blocks = w.reshape(N, K // group_size, group_size)
+    block_amax = w_blocks.abs().amax(dim=2).clamp_min(1e-12)
+    s_block = _cast_fp8_e4m3((block_amax / FP4_E2M1_MAX) / s_global)
+    s_block = s_block.clamp_min(1e-12)
+    return s_global.to(torch.float32), s_block.contiguous()
+
+
+def _nvfp4_effective_scale(
+    s_global: torch.Tensor, s_block: torch.Tensor
+) -> torch.Tensor:
+    """``s_global * s_block`` broadcast to ``s_block``'s shape."""
+    return s_global.reshape(1, 1) * s_block
+
+
+def nvfp4_quantize(
+    w: torch.Tensor, *, group_size: int = NVFP4_BLOCK_SIZE
+) -> QuantizedWeight:
+    """Official NVFP4 RTN (Transformer Engine hierarchical scaling).
+
+    ``group_size`` controls the block dimension and must be 16 for NVFP4.
+    Stores ``weight_scale = s_global`` ``(1,)`` and
+    ``weight_scale_2 = s_block`` ``(N, K/group_size)``.
+    """
+    _validate_nvfp4_group_size(group_size)
+    w_fp32 = w.detach().to(torch.float32)
+    N, K = w_fp32.shape
+    s_global, s_block = _nvfp4_compute_scales(w_fp32, group_size)
+    effective = _nvfp4_effective_scale(s_global, s_block)  # (N, num_blocks)
+    scaled = (
+        w_fp32.reshape(N, K // group_size, group_size)
+        / effective.unsqueeze(2)
+    ).reshape(N, K)
+    codes, _ = _fp4_e2m1_quantize(scaled)
+    return QuantizedWeight(
+        qweight=codes,
+        weight_scale=s_global.contiguous(),
+        group_size=group_size,
+        weight_bits=4,
+        weight_format="nvfp",
+        weight_scale_2=s_block,
+    )
+
+
+def nvfp4_dequantize(
+    codes: torch.Tensor,
+    s_global: torch.Tensor,
+    s_block: torch.Tensor,
+    group_size: int = NVFP4_BLOCK_SIZE,
+) -> torch.Tensor:
+    """``x = e2m1(codes) * s_block * s_global``."""
+    _validate_nvfp4_group_size(group_size)
+    N, K = codes.shape
+    if K % group_size != 0 or s_block.shape != (N, K // group_size):
+        raise ValueError(
+            "NVFP4 scale shape mismatch: expected "
+            f"{(N, K // group_size)} for codes shape {(N, K)}, "
+            f"got {tuple(s_block.shape)}."
+        )
+    vals = _fp4_e2m1_dequantize(codes, device=codes.device)
+    return (
+        vals.reshape(N, K // group_size, group_size)
+        * s_block.unsqueeze(2)
+        * s_global.reshape(1, 1, 1)
+    ).reshape(N, K)
+
+
+def nvfp4_quantize_activation(
+    x: torch.Tensor,
+    *,
+    group_size: int = NVFP4_BLOCK_SIZE,
+    num_samples: int,
+) -> torch.Tensor:
+    """Online official NVFP4 for activations (software emulation).
+
+    Applies one ``s_global`` per sample and per-token per-16-element FP8
+    ``s_block`` along the last dimension, then rounds to E2M1 and dequantizes
+    back to float. Leading rows must contain equally sized, contiguous samples.
+    """
+    _validate_nvfp4_group_size(group_size)
+    if num_samples <= 0:
+        raise ValueError(f"num_samples must be positive, got {num_samples}.")
+    if x.shape[-1] % group_size != 0:
+        raise ValueError(
+            f"NVFP4 activations require last dim divisible by "
+            f"group_size={group_size}, got {x.shape[-1]}."
+        )
+    x32 = x.to(torch.float32)
+    orig_shape = x32.shape
+    D = orig_shape[-1]
+    flat = x32.reshape(-1, D)
+    M = flat.shape[0]
+    if M % num_samples != 0:
+        raise ValueError(
+            "NVFP4 activation rows must divide evenly into samples: "
+            f"rows={M}, num_samples={num_samples}."
+        )
+    num_blocks = D // group_size
+    rows_per_sample = M // num_samples
+    samples = flat.reshape(num_samples, rows_per_sample, D)
+
+    global_amax = samples.abs().amax(dim=(1, 2), keepdim=True).clamp_min(1e-12)
+    s_global = global_amax / (FP8_E4M3_MAX * FP4_E2M1_MAX)
+
+    blocks = samples.reshape(
+        num_samples, rows_per_sample, num_blocks, group_size
+    )
+    block_amax = blocks.abs().amax(dim=3).clamp_min(1e-12)
+    s_block = _cast_fp8_e4m3(
+        (block_amax / FP4_E2M1_MAX) / s_global
+    ).clamp_min(1e-12)
+
+    effective_scale = s_global * s_block
+    scaled = blocks / effective_scale.unsqueeze(3)
+    _, q_vals = _fp4_e2m1_quantize(scaled)
+    dequant = q_vals * effective_scale.unsqueeze(3)
+    return dequant.reshape(orig_shape)
+
+
+# --------------------------------------------------------------------------- #
+# QuantizedWeight + format-aware scale / round helpers.                        #
 # --------------------------------------------------------------------------- #
 
 
@@ -107,31 +378,54 @@ def channel_percentile_amax(
 class QuantizedWeight:
     """Single result type for every quantizer; mirrors the pack on-disk layout."""
 
-    qweight: torch.Tensor       # (N, K) int8 in [qmin, qmax] for weight_bits
-    weight_scale: torch.Tensor  # (N,) or (N, num_groups) float32
-    group_size: int             # -1 ⇒ per-channel
+    qweight: torch.Tensor       # (N, K) int8 codes
+    weight_scale: torch.Tensor  # (N,) / (N, num_groups) / NVFP4 s_global (1,)
+    group_size: int             # -1 ⇒ per-channel; NVFP4 uses 16
     weight_bits: int = 4
-    # Optional residual term used by RTN-residual: a low-rank correction
-    # holding the part of the weight that the int4 grid couldn't capture.
-    # Stored at bf16 / fp32; cheap because rank is tiny.
+    # "int" = signed symmetric integer grid
+    # "fp"  = E2M1 + single-level per-group scale
+    # "nvfp" = official NVFP4 (E2M1 + s_block FP8 + s_global FP32)
+    weight_format: str = "int"
     residual: torch.Tensor | None = None  # (N, K) or None
-    # Full-precision rotated weight when ``weight_bits == NO_QUANT_BITS``.
     fp_weight: torch.Tensor | None = None  # (N, K) float32
+    # NVFP4 per-block FP8 scales ``(N, K/16)``; None for int/fp.
+    weight_scale_2: torch.Tensor | None = None
 
 
-def _compute_scale(
-    w: torch.Tensor, group_size: int, *, weight_bits: int
-) -> torch.Tensor:
-    """Per-row amax-based scale; reshape into groups if requested.
+def _int_fp_grid_max(weight_format: str, weight_bits: int) -> float:
+    """Max representable value on the single-level quantization grid.
 
-    For symmetric quantization the scale is just ``amax / qmax`` so that the
-    largest magnitude in each group lands exactly on the quant grid edge.
+    Used by int / plain-fp scale fitting. NVFP4 uses two-level scales and
+    must not go through this helper.
     """
-    _, qmax = symmetric_quant_range(weight_bits)
+    if weight_format == "fp":
+        return FP4_E2M1_MAX
+    if weight_format == "int":
+        _, qmax = symmetric_quant_range(weight_bits)
+        return float(qmax)
+    if weight_format == "nvfp":
+        raise ValueError(
+            "_int_fp_grid_max does not apply to weight_format='nvfp'; "
+            "use NVFP4 two-level scales (s_global / s_block) instead."
+        )
+    raise ValueError(
+        f"weight_format must be 'int', 'fp', or 'nvfp', got {weight_format!r}."
+    )
+
+
+def _int_fp_compute_scale(
+    w: torch.Tensor,
+    group_size: int,
+    *,
+    weight_bits: int,
+    weight_format: str = "int",
+) -> torch.Tensor:
+    """Per-group amax-based scale for int / plain-fp formats."""
+    gmax = _int_fp_grid_max(weight_format, weight_bits)
     N, K = w.shape
     if group_size <= 0 or group_size >= K:
         amax = w.abs().amax(dim=1).clamp_min_(1e-12)
-        return (amax / qmax).contiguous()  # (N,)
+        return (amax / gmax).contiguous()
     if K % group_size != 0:
         raise ValueError(
             f"K={K} not divisible by group_size={group_size}; "
@@ -140,42 +434,111 @@ def _compute_scale(
     num_groups = K // group_size
     grouped = w.reshape(N, num_groups, group_size)
     amax = grouped.abs().amax(dim=2).clamp_min_(1e-12)
-    return (amax / qmax).contiguous()  # (N, num_groups)
+    return (amax / gmax).contiguous()
 
 
-def _quantize(
-    w: torch.Tensor, scale: torch.Tensor, group_size: int, *, weight_bits: int
+def _int_fp_quantize(
+    w: torch.Tensor,
+    scale: torch.Tensor,
+    group_size: int,
+    *,
+    weight_bits: int,
+    weight_format: str = "int",
 ) -> torch.Tensor:
-    """Apply a precomputed scale and round to the symmetric ``weight_bits`` grid."""
-    qmin, qmax = symmetric_quant_range(weight_bits)
+    """Round ``w / scale`` to the nearest grid point. Returns int8 codes.
+
+    Single-level formats only (``int`` / ``fp``). NVFP4 uses
+    :func:`nvfp4_quantize` instead.
+    """
+    del group_size  # scale already encodes grouping; kept for call-site symmetry.
     N, K = w.shape
-    if scale.ndim == 1:  # per-channel
-        s = scale.unsqueeze(1)  # (N, 1)
-        q = torch.round(w / s).clamp_(qmin, qmax).to(torch.int8)
-        return q
-    # per-group
+    if scale.ndim == 1:
+        scaled = w / scale.unsqueeze(1)
+    else:
+        num_groups = scale.shape[1]
+        gs = K // num_groups
+        scaled = (w.reshape(N, num_groups, gs) / scale.unsqueeze(2)).reshape(N, K)
+
+    if weight_format == "fp":
+        codes, _ = _fp4_e2m1_quantize(scaled)
+        return codes
+    if weight_format == "int":
+        qmin, qmax = symmetric_quant_range(weight_bits)
+        return torch.round(scaled).clamp_(qmin, qmax).to(torch.int8)
+    if weight_format == "nvfp":
+        raise ValueError(
+            "_int_fp_quantize does not apply to weight_format='nvfp'; "
+            "use nvfp4_quantize instead."
+        )
+    raise ValueError(
+        f"weight_format must be 'int', 'fp', or 'nvfp', got {weight_format!r}."
+    )
+
+
+def _int_fp_dequantize(
+    codes: torch.Tensor,
+    scale: torch.Tensor,
+    group_size: int,
+    *,
+    weight_format: str = "int",
+) -> torch.Tensor:
+    """Inverse of :func:`_int_fp_quantize`. Returns float32.
+
+    Single-level formats only (``int`` / ``fp``). NVFP4 uses
+    :func:`nvfp4_dequantize` instead.
+    """
+    del group_size
+    N, K = codes.shape
+    if weight_format == "fp":
+        vals = _fp4_e2m1_dequantize(codes, device=codes.device)
+    elif weight_format == "int":
+        vals = codes.to(torch.float32)
+    elif weight_format == "nvfp":
+        raise ValueError(
+            "_int_fp_dequantize does not apply to weight_format='nvfp'; "
+            "use nvfp4_dequantize instead."
+        )
+    else:
+        raise ValueError(
+            f"weight_format must be 'int', 'fp', or 'nvfp', got {weight_format!r}."
+        )
+
+    if scale.ndim == 1:
+        return vals * scale.unsqueeze(1)
     num_groups = scale.shape[1]
-    assert num_groups * group_size == K
-    grouped = w.reshape(N, num_groups, group_size)
-    q = torch.round(grouped / scale.unsqueeze(2)).clamp_(qmin, qmax).to(torch.int8)
-    return q.reshape(N, K)
+    gs = K // num_groups
+    return (vals.reshape(N, num_groups, gs) * scale.unsqueeze(2)).reshape(N, K)
+
+
+# --------------------------------------------------------------------------- #
+# RTN — round-to-nearest.                                                     #
+# --------------------------------------------------------------------------- #
 
 
 def rtn_quantize(
-    w: torch.Tensor, *, group_size: int = 128, weight_bits: int = 4
+    w: torch.Tensor,
+    *,
+    group_size: int = 128,
+    weight_bits: int = 4,
+    weight_format: str = "int",
 ) -> QuantizedWeight:
     """Plain round-to-nearest. The fastest baseline."""
+    if weight_format == "nvfp":
+        return nvfp4_quantize(w, group_size=group_size)
     w_fp32 = w.detach().to(torch.float32)
-    scale = _compute_scale(w_fp32, group_size, weight_bits=weight_bits)
-    qweight = _quantize(
-        w_fp32, scale, group_size, weight_bits=weight_bits
+    scale = _int_fp_compute_scale(
+        w_fp32, group_size, weight_bits=weight_bits, weight_format=weight_format,
+    )
+    qweight = _int_fp_quantize(
+        w_fp32, scale, group_size,
+        weight_bits=weight_bits, weight_format=weight_format,
     )
     return QuantizedWeight(
         qweight=qweight,
         weight_scale=scale,
         group_size=group_size,
         weight_bits=weight_bits,
-        residual=None,
+        weight_format=weight_format,
     )
 
 
@@ -185,23 +548,15 @@ def rtn_residual_quantize(
     group_size: int = 128,
     keep_top_k_outlier_cols: int = 0,
     weight_bits: int = 4,
+    weight_format: str = "int",
 ) -> QuantizedWeight:
     """RTN with a low-rank-ish residual to absorb the brightest outliers.
 
-    The QVLA README describes the DiT-side quantizer as "RTN residual".
-    The minimal interpretation we adopt:
-
       W ≈ dequant(RTN(W - Δ)) + Δ
 
-    where ``Δ`` is a sparse correction that stores the ``keep_top_k`` columns
-    of ``W`` with the largest L2 norm at full precision (those are the columns
-    that the rotation couldn't tame). The residual stores ``Δ`` densely
-    (``(N, K)`` with zeros elsewhere); only the picked columns are non-zero so
-    bf16 storage is cheap relative to a full bf16 matrix on disk.
-
-    Passing ``keep_top_k_outlier_cols=0`` (the default) makes this identical to
-    plain RTN; raise it to absorb whatever fraction of outliers your model
-    needs. Setting it to a small positive integer like 8 is usually enough.
+    where ``Δ`` stores the ``keep_top_k`` columns of ``W`` with the largest
+    L2 norm at full precision. Passing ``keep_top_k_outlier_cols=0`` (the
+    default) makes this identical to plain RTN.
     """
     w_fp32 = w.detach().to(torch.float32)
     N, K = w_fp32.shape
@@ -210,7 +565,6 @@ def rtn_residual_quantize(
     if keep_top_k_outlier_cols > 0:
         col_norms = w_fp32.pow(2).sum(dim=0)
         top_k = min(keep_top_k_outlier_cols, K)
-        # `top_k` indices of largest-magnitude columns.
         idx = torch.topk(col_norms, top_k).indices
         residual[:, idx] = w_fp32[:, idx]
         w_quantizable = w_fp32.clone()
@@ -218,16 +572,31 @@ def rtn_residual_quantize(
     else:
         w_quantizable = w_fp32
 
-    scale = _compute_scale(w_quantizable, group_size, weight_bits=weight_bits)
-    qweight = _quantize(
-        w_quantizable, scale, group_size, weight_bits=weight_bits
+    if weight_format == "nvfp":
+        qw = nvfp4_quantize(w_quantizable, group_size=group_size)
+        return QuantizedWeight(
+            qweight=qw.qweight,
+            weight_scale=qw.weight_scale,
+            group_size=qw.group_size,
+            weight_bits=4,
+            weight_format="nvfp",
+            residual=residual.to(torch.float16) if residual is not None else None,
+            weight_scale_2=qw.weight_scale_2,
+        )
+
+    scale = _int_fp_compute_scale(
+        w_quantizable, group_size, weight_bits=weight_bits, weight_format=weight_format,
+    )
+    qweight = _int_fp_quantize(
+        w_quantizable, scale, group_size,
+        weight_bits=weight_bits, weight_format=weight_format,
     )
     return QuantizedWeight(
         qweight=qweight,
         weight_scale=scale,
         group_size=group_size,
         weight_bits=weight_bits,
-        # Stored as fp16 to halve disk size; pi05 runs at bf16 anyway.
+        weight_format=weight_format,
         residual=residual.to(torch.float16) if residual is not None else None,
     )
 
@@ -278,6 +647,31 @@ def _hessian_inv_chol(
 # --------------------------------------------------------------------------- #
 
 
+def _quantize_col(
+    w_col: torch.Tensor,
+    s: torch.Tensor,
+    weight_format: str,
+    weight_bits: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize a single column ``(N,)`` and return ``(codes_int8, dequant_fp32)``.
+
+    ``s`` is the per-row scale already applied to this column:
+    - ``int`` / ``fp``: the single-level group scale
+    - ``nvfp``: the effective scale ``s_global * s_block``
+    """
+    scaled = w_col / s
+    if weight_format in ("fp", "nvfp"):
+        codes, q_vals = _fp4_e2m1_quantize(scaled)
+        return codes, q_vals * s
+    if weight_format == "int":
+        qmin, qmax = symmetric_quant_range(weight_bits)
+        q = torch.round(scaled).clamp_(qmin, qmax)
+        return q.to(torch.int8), q * s
+    raise ValueError(
+        f"weight_format must be 'int', 'fp', or 'nvfp', got {weight_format!r}."
+    )
+
+
 def gptq_quantize(
     w: torch.Tensor,
     hessian: torch.Tensor,
@@ -286,32 +680,13 @@ def gptq_quantize(
     block_size: int = 128,
     damp_percent: float = 0.01,
     weight_bits: int = 4,
+    weight_format: str = "int",
 ) -> QuantizedWeight:
-    """GPTQ from Frantar et al. 2022, written from scratch.
+    """GPTQ from Frantar et al. 2022.
 
-    Arguments:
-        w: ``(N, K)`` float matrix — the rotated, full-precision weight.
-        hessian: ``(K, K)`` symmetric PSD matrix — typically
-            ``XᵀX / num_calibration_tokens`` of the post-rotation activations.
-            Re-using the same matrix that fed the rotation fit is fine.
-        group_size: width along K of each scale group. Use ``-1`` for
-            per-channel.
-        block_size: column-block size for the GPTQ inner loop. Smaller =
-            slower but slightly more accurate; ``block_size == group_size`` is
-            the standard sweet spot.
-        damp_percent: diagonal damping fraction. ``0.01`` matches the QVLA
-            paper default.
-
-    Returns:
-        :class:`QuantizedWeight`. The output dequantizes (``q · scale``) to a
-        weight that is closer to the original than RTN in a Hessian-weighted
-        sense.
-
-    Implementation:
-        1. Damp the Hessian and Cholesky-factor `H⁻¹`.
-        2. Walk columns in blocks. For each block we maintain the in-block
-           quantization error and propagate it to the unquantized columns
-           on the right via the Cholesky-decomposed inverse Hessian.
+    Supports ``int``, plain ``fp`` (E2M1 + per-group scale), and official
+    ``nvfp`` (E2M1 + FP8 block scale + FP32 global scale). The error-
+    compensation loop is grid-agnostic.
     """
     if w.ndim != 2:
         raise ValueError(f"gptq_quantize expects (N, K), got {tuple(w.shape)}.")
@@ -322,82 +697,109 @@ def gptq_quantize(
         )
     device = w.device
     N, K = w.shape
-    qmin, qmax = symmetric_quant_range(weight_bits)
+    use_nvfp = weight_format == "nvfp"
+    if use_nvfp:
+        _validate_nvfp4_group_size(group_size)
+    elif weight_format in ("int", "fp"):
+        gmax = _int_fp_grid_max(weight_format, weight_bits)
+    else:
+        raise ValueError(
+            f"weight_format must be 'int', 'fp', or 'nvfp', got {weight_format!r}."
+        )
 
     W = w.to(torch.float32).clone()
     H = hessian.to(torch.float32).clone()
 
-    # 1. Dead columns: any K-th feature with zero diagonal Hessian carries no
-    #    gradient information; set its weight column to zero so it doesn't
-    #    blow up the inverse below.
     dead = torch.diag(H) == 0.0
     H[dead, dead] = 1.0
     W[:, dead] = 0.0
 
-    # 2. Damp the diagonal so the Cholesky is well-conditioned.
-    # 3. Inverse-Cholesky for "look ahead and propagate quant error".
     Hinv_chol = _hessian_inv_chol(H, damp_percent=damp_percent)
 
-    # 4. Quantize block by block.
     if group_size <= 0:
         group_size = K
     if K % group_size != 0:
         raise ValueError(f"K={K} not divisible by group_size={group_size}.")
     num_groups = K // group_size
-    scales = torch.zeros(N, num_groups, dtype=torch.float32, device=device)
+
+    if use_nvfp:
+        global_amax = W.abs().amax().clamp_min(1e-12)
+        s_global = (global_amax / (FP8_E4M3_MAX * FP4_E2M1_MAX)).reshape(1)
+        s_block = torch.zeros(N, num_groups, dtype=torch.float32, device=device)
+        scales = None
+    else:
+        s_global = None
+        s_block = None
+        scales = torch.zeros(N, num_groups, dtype=torch.float32, device=device)
+
     qweight = torch.zeros(N, K, dtype=torch.int8, device=device)
 
     for col_start in range(0, K, block_size):
         col_end = min(col_start + block_size, K)
-        block_W = W[:, col_start:col_end].clone()           # (N, b)
+        block_W = W[:, col_start:col_end].clone()
         block_Q = torch.zeros_like(block_W, dtype=torch.int8)
-        block_err = torch.zeros_like(block_W)               # (N, b)
-        block_Hinv = Hinv_chol[col_start:col_end, col_start:col_end].clone()  # (b, b)
+        block_err = torch.zeros_like(block_W)
+        block_Hinv = Hinv_chol[col_start:col_end, col_start:col_end].clone()
 
         for j in range(col_end - col_start):
             col_idx = col_start + j
             w_col = block_W[:, j].clone()
             d_jj = block_Hinv[j, j].clamp_min(1e-12)
+            grp = col_idx // group_size
 
-            # Pick this column's group scale on the first column of each group.
             if col_idx % group_size == 0:
-                grp = col_idx // group_size
-                g_start = col_idx
                 g_end = min(col_idx + group_size, K)
-                # The fitted scale uses the *current* (error-compensated) view
-                # of the upcoming group — that's the GPTQ trick: by the time we
-                # reach this column we've already absorbed the rounding error of
-                # the previous columns into W[:, col_idx:].
-                grp_view = W[:, g_start:g_end]
-                amax = grp_view.abs().amax(dim=1).clamp_min_(1e-12)
-                scales[:, grp] = amax / qmax
-            s = scales[:, col_idx // group_size]  # (N,)
+                grp_view = W[:, col_idx:g_end]
+                if use_nvfp:
+                    # s_global is frozen from the initial W (codes already
+                    # emitted for prior groups use it). Clamp the block scale
+                    # argument so GPTQ error growth cannot overflow FP8.
+                    block_amax = grp_view.abs().amax(dim=1).clamp_min(1e-12)
+                    raw = (block_amax / FP4_E2M1_MAX) / s_global
+                    s_block[:, grp] = _cast_fp8_e4m3(raw).clamp_min(1e-12)
+                else:
+                    amax = grp_view.abs().amax(dim=1).clamp_min_(1e-12)
+                    scales[:, grp] = amax / gmax
 
-            q = torch.round(w_col / s).clamp_(qmin, qmax)
-            block_Q[:, j] = q.to(torch.int8)
+            if use_nvfp:
+                s = (s_global.reshape(1) * s_block[:, grp]).reshape(N)
+            else:
+                s = scales[:, grp]
 
-            # De-quant error for this column.
-            err_col = (w_col - q * s) / d_jj  # (N,)
+            codes, w_dequant = _quantize_col(w_col, s, weight_format, weight_bits)
+            block_Q[:, j] = codes
+
+            err_col = (w_col - w_dequant) / d_jj
             block_err[:, j] = err_col
 
-            # Propagate to remaining columns inside this block.
             if j + 1 < (col_end - col_start):
-                block_W[:, j + 1 :] -= err_col.unsqueeze(1) * block_Hinv[j, j + 1 :].unsqueeze(0)
+                block_W[:, j + 1:] -= (
+                    err_col.unsqueeze(1) * block_Hinv[j, j + 1:].unsqueeze(0)
+                )
 
         qweight[:, col_start:col_end] = block_Q
 
-        # Propagate the block's accumulated error to the *remaining* columns
-        # outside this block (the look-ahead step).
         if col_end < K:
             W[:, col_end:] -= block_err @ Hinv_chol[col_start:col_end, col_end:]
 
+    if use_nvfp:
+        return QuantizedWeight(
+            qweight=qweight.contiguous(),
+            weight_scale=s_global.contiguous(),
+            group_size=group_size,
+            weight_bits=weight_bits,
+            weight_format="nvfp",
+            weight_scale_2=s_block.contiguous(),
+        )
     return QuantizedWeight(
         qweight=qweight.contiguous(),
         weight_scale=scales.contiguous(),
         group_size=group_size,
         weight_bits=weight_bits,
-        residual=None,
+        weight_format=weight_format,
     )
+
+
 
 
 # --------------------------------------------------------------------------- #
@@ -425,6 +827,7 @@ def quantize_weight(
     *,
     group_size: int,
     weight_bits: int = 4,
+    weight_format: str = "int",
     hessian: torch.Tensor | None = None,
     gptq_block_size: int = 128,
     gptq_damp_percent: float = 0.01,
@@ -432,22 +835,26 @@ def quantize_weight(
 ) -> QuantizedWeight:
     """Dispatch to the requested quantizer.
 
-    ``quantizer`` is one of ``"rtn"``, ``"rtn_residual"``, ``"gptq"``. ``gptq``
-    requires ``hessian``; the others ignore it.
-
-    When ``weight_bits >= NO_QUANT_BITS`` (16), the weight is stored at full
-    precision and no quantizer is run.
+    ``quantizer`` is one of ``"rtn"``, ``"rtn_residual"``, ``"gptq"``.
+    ``weight_format`` selects the number grid (``"int"``/``"fp"``/``"nvfp"``).
+    All three quantizers support all formats — GPTQ's error-compensation loop
+    is grid-agnostic.
     """
     if is_no_quant(weight_bits):
         return no_quantize(w)
+
     if quantizer == "rtn":
-        return rtn_quantize(w, group_size=group_size, weight_bits=weight_bits)
+        return rtn_quantize(
+            w, group_size=group_size, weight_bits=weight_bits,
+            weight_format=weight_format,
+        )
     if quantizer == "rtn_residual":
         return rtn_residual_quantize(
             w,
             group_size=group_size,
             keep_top_k_outlier_cols=rtn_residual_top_k,
             weight_bits=weight_bits,
+            weight_format=weight_format,
         )
     if quantizer == "gptq":
         if hessian is None:
@@ -458,6 +865,7 @@ def quantize_weight(
             block_size=gptq_block_size,
             damp_percent=gptq_damp_percent,
             weight_bits=weight_bits,
+            weight_format=weight_format,
         )
     raise ValueError(f"Unknown quantizer: {quantizer!r}")
 
@@ -474,26 +882,46 @@ def dequantize(qw: QuantizedWeight) -> torch.Tensor:
                 f"weight_bits={qw.weight_bits} requires fp_weight but none was stored."
             )
         return qw.fp_weight.to(torch.float32)
-    q = qw.qweight.to(torch.float32)
-    N, K = q.shape
-    if qw.weight_scale.ndim == 1:
-        out = q * qw.weight_scale.unsqueeze(1)
+
+    fmt = getattr(qw, "weight_format", "int")
+    if fmt == "nvfp":
+        if qw.weight_scale_2 is None:
+            raise ValueError("NVFP4 dequant requires weight_scale_2 (s_block).")
+        out = nvfp4_dequantize(
+            qw.qweight,
+            qw.weight_scale,
+            qw.weight_scale_2,
+            group_size=qw.group_size,
+        )
+    elif fmt in ("int", "fp"):
+        out = _int_fp_dequantize(
+            qw.qweight,
+            qw.weight_scale,
+            qw.group_size,
+            weight_format=fmt,
+        )
     else:
-        num_groups = qw.weight_scale.shape[1]
-        gs = K // num_groups
-        out = (q.reshape(N, num_groups, gs) * qw.weight_scale.unsqueeze(2)).reshape(N, K)
+        raise ValueError(
+            f"weight_format must be 'int', 'fp', or 'nvfp', got {fmt!r}."
+        )
     if qw.residual is not None:
         out = out + qw.residual.to(torch.float32)
     return out
 
 
 __all__ = [
+    "FP4_E2M1_MAX",
+    "FP8_E4M3_MAX",
     "NO_QUANT_BITS",
+    "NVFP4_BLOCK_SIZE",
     "QuantizedWeight",
     "dequantize",
     "gptq_quantize",
     "is_no_quant",
     "no_quantize",
+    "nvfp4_dequantize",
+    "nvfp4_quantize",
+    "nvfp4_quantize_activation",
     "channel_percentile_amax",
     "token_percentile_amax",
     "percentile_amax",
